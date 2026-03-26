@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  neo-search-worker:
+    image: neo-search-worker:latest   # build locally first, or use registry
+    # build: .                        # uncomment to build from source
+    container_name: neo-search-worker
+    restart: unless-stopped
+    ports:
+      - "3210:3210"
+    environment:
+      PORT: "3210"
+      WORKER_SECRET: "${WORKER_SECRET}"
+      SUPABASE_URL: "${SUPABASE_URL}"
+      SUPABASE_SERVICE_ROLE_KEY: "${SUPABASE_SERVICE_ROLE_KEY}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3210/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

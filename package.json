@@ -1,0 +1,14 @@
+{
+  "name": "neo-search-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.43.4",
+    "fastify": "^4.27.0"
+  }
+}
