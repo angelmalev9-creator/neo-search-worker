@@ -3,18 +3,16 @@ import { createClient } from "@supabase/supabase-js";
 
 const app = Fastify({ logger: true });
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
 app.addHook("preHandler", async (req, reply) => {
-  if (req.url === "/health") return; // health check skips auth
+  if (req.url === "/health") return;
   const auth = req.headers["authorization"] ?? "";
   if (!WORKER_SECRET || auth !== `Bearer ${WORKER_SECRET}`) {
     reply.code(401).send({ error: "Unauthorized" });
   }
 });
 
-// ── Supabase client ───────────────────────────────────────────────────────────
 function getSupabase() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -22,108 +20,323 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// ── Text search helpers ───────────────────────────────────────────────────────
-
-/**
- * Score a text block against query keywords.
- * Returns { score, excerpts[] }
- */
-function scoreText(text, keywords) {
-  if (!text || !keywords.length) return { score: 0, excerpts: [] };
-  const lower = text.toLowerCase();
-  let score = 0;
-  const excerpts = [];
-
-  for (const kw of keywords) {
-    const kwLower = kw.toLowerCase();
-    let idx = lower.indexOf(kwLower);
-    while (idx !== -1) {
-      score += 1;
-      // Extract ±120 chars around the match
-      const start = Math.max(0, idx - 120);
-      const end = Math.min(text.length, idx + kw.length + 120);
-      const excerpt = text.slice(start, end).trim();
-      if (!excerpts.includes(excerpt)) excerpts.push(excerpt);
-      idx = lower.indexOf(kwLower, idx + 1);
-    }
-  }
-
-  return { score, excerpts: excerpts.slice(0, 5) };
+function asArray(v) {
+  return Array.isArray(v) ? v : [];
 }
 
-/**
- * Tokenise a natural-language query into keywords.
- * Removes stop words, returns unique stems ≥3 chars.
- */
+function normalizeText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/×/g, "x")
+    .replace(/\bсм\.?\b/giu, " cm ")
+    .replace(/[^\p{L}\p{N}\s.x-]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function tokenise(query) {
   const STOP = new Set([
     "и", "в", "на", "се", "за", "от", "с", "е", "да", "не", "ли",
     "но", "а", "или", "как", "що", "ще", "сте", "има", "при", "до",
-    "the", "a", "an", "of", "in", "is", "for", "to", "what", "how",
+    "искам", "търся", "търсите", "търсяте", "кажи", "кажете", "покажи", "дай",
+    "има", "ако", "като", "about", "the", "a", "an", "of", "in", "is",
+    "for", "to", "what", "how", "with", "have", "has",
   ]);
-  return [
-    ...new Set(
-      query
-        .toLowerCase()
-        .replace(/[^\w\sа-яА-Я]/gu, " ")
-        .split(/\s+/)
-        .filter((w) => w.length >= 3 && !STOP.has(w))
-    ),
-  ];
+
+  const base = normalizeText(query)
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !STOP.has(w));
+
+  const dims = extractDimensionTokens(query);
+  return [...new Set([...base, ...dims])];
 }
 
-/**
- * Search through pages[] inside structured_data of a session.
- */
-function searchPages(pages, keywords, limit = 5) {
-  const results = [];
+function extractDimensionTokens(text) {
+  const out = new Set();
+  const raw = String(text ?? "").toLowerCase().replace(/×/g, "x");
 
-  for (const page of pages ?? []) {
-    const content =
-      (page.content ?? "") +
-      " " +
-      JSON.stringify(page.structured ?? {});
+  for (const m of raw.matchAll(/\b(\d{1,4})\s*[xх]\s*(\d{1,4})\b/gu)) {
+    out.add(`${m[1]}x${m[2]}`);
+    out.add(`${m[1]} ${m[2]}`);
+  }
 
-    const { score, excerpts } = scoreText(content, keywords);
-    if (score > 0) {
-      results.push({
-        url: page.url ?? "",
-        title: page.title ?? "",
-        pageType: page.pageType ?? "general",
-        score,
-        excerpts,
+  for (const m of raw.matchAll(/\b(\d{1,4})\s+на\s+(\d{1,4})\b/gu)) {
+    out.add(`${m[1]}x${m[2]}`);
+    out.add(`${m[1]} ${m[2]}`);
+  }
+
+  return [...out];
+}
+
+function inferIntent(tokens) {
+  const set = new Set(tokens);
+  return {
+    wantsCarpet: ["килим", "килими", "пътека", "пътеки", "runner", "carpet", "rug"].some((t) => set.has(t)),
+    wantsFurniture: ["гардероб", "легло", "диван", "маса", "стол"].some((t) => set.has(t)),
+    wantsPromo: ["промо", "промоция", "намаление", "оферта", "offers", "sale"].some((t) => set.has(t)),
+  };
+}
+
+function stringifySafe(value) {
+  try {
+    return JSON.stringify(value ?? {});
+  } catch {
+    return "";
+  }
+}
+
+function makeExcerpt(text, tokens, maxLen = 220) {
+  const original = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!original) return "";
+  const lower = normalizeText(original);
+
+  let bestIdx = 0;
+  for (const token of tokens) {
+    const idx = lower.indexOf(token);
+    if (idx !== -1) {
+      bestIdx = idx;
+      break;
+    }
+  }
+
+  const start = Math.max(0, bestIdx - 80);
+  const end = Math.min(original.length, start + maxLen);
+  return original.slice(start, end).trim();
+}
+
+function scoreCandidate(candidate, tokens, queryDims, intent) {
+  const hay = normalizeText(candidate.searchText);
+  if (!hay) return { score: 0, matched: [] };
+
+  let score = 0;
+  const matched = [];
+
+  for (const token of tokens) {
+    if (!token) continue;
+    if (hay.includes(token)) {
+      score += token.length >= 5 ? 3 : 2;
+      matched.push(token);
+    }
+  }
+
+  for (const dim of queryDims) {
+    if (hay.includes(dim)) {
+      score += 6;
+      matched.push(dim);
+    }
+  }
+
+  if (candidate.kind === "product") score += 4;
+  if (candidate.kind === "category") score += 2;
+  if (candidate.kind === "page") score += 1;
+
+  const title = normalizeText(candidate.title);
+  const url = normalizeText(candidate.url);
+
+  if (intent.wantsCarpet) {
+    if (hay.includes("килим") || hay.includes("пътека") || title.includes("килим") || title.includes("пътека") || url.includes("kilim") || url.includes("carpet")) {
+      score += 8;
+    } else {
+      score -= 6;
+    }
+  }
+
+  if (intent.wantsFurniture) {
+    if (hay.includes("гардероб") || hay.includes("легло") || hay.includes("диван")) score += 8;
+  }
+
+  if (intent.wantsPromo && (hay.includes("промо") || hay.includes("намал") || url.includes("promotions"))) {
+    score += 5;
+  }
+
+  if (candidate.kind === "summary") score -= 4;
+  if (candidate.kind === "page" && url.includes("/promotions")) score -= 2;
+
+  return { score, matched: [...new Set(matched)] };
+}
+
+function pushCandidate(list, candidate) {
+  const searchText = [candidate.title, candidate.subtitle, candidate.text, candidate.metaText, candidate.url]
+    .filter(Boolean)
+    .join(" \n ");
+
+  if (!searchText.trim()) return;
+
+  list.push({
+    kind: candidate.kind || "block",
+    url: candidate.url || "",
+    title: candidate.title || "",
+    subtitle: candidate.subtitle || "",
+    text: candidate.text || "",
+    metaText: candidate.metaText || "",
+    searchText,
+  });
+}
+
+function flattenStructuredData(structuredData) {
+  const items = [];
+  if (!structuredData || typeof structuredData !== "object") return items;
+
+  const pages = asArray(structuredData.pages);
+  for (const page of pages) {
+    const pageText = [
+      page.title,
+      page.url,
+      page.pageType,
+      page.content,
+      stringifySafe(page.structured),
+    ].filter(Boolean).join(" \n ");
+
+    pushCandidate(items, {
+      kind: "page",
+      url: page.url,
+      title: page.title || page.pageType || "Page",
+      text: pageText,
+    });
+  }
+
+  const sections = asArray(structuredData.sections);
+  for (const section of sections) {
+    pushCandidate(items, {
+      kind: "section",
+      url: section.url || "",
+      title: section.title || section.name || "Section",
+      subtitle: section.type || "",
+      text: stringifySafe(section),
+    });
+  }
+
+  const products = [
+    ...asArray(structuredData.products),
+    ...asArray(structuredData.catalog_products),
+    ...asArray(structuredData.featured_products),
+    ...asArray(structuredData.promotions),
+    ...asArray(structuredData.offers),
+  ];
+
+  for (const product of products) {
+    pushCandidate(items, {
+      kind: "product",
+      url: product.url || product.link || "",
+      title: product.title || product.name || product.product_name || "Product",
+      subtitle: [product.category, product.brand, product.color, product.size].filter(Boolean).join(" • "),
+      text: stringifySafe(product),
+      metaText: [product.price, product.currency, product.sku].filter(Boolean).join(" "),
+    });
+  }
+
+  const categories = [
+    ...asArray(structuredData.categories),
+    ...asArray(structuredData.catalog_categories),
+    ...asArray(structuredData.navigation),
+  ];
+
+  for (const cat of categories) {
+    pushCandidate(items, {
+      kind: "category",
+      url: cat.url || cat.link || "",
+      title: cat.title || cat.name || cat.label || "Category",
+      text: stringifySafe(cat),
+    });
+  }
+
+  const faqs = asArray(structuredData.faq || structuredData.faqs);
+  for (const faq of faqs) {
+    pushCandidate(items, {
+      kind: "faq",
+      title: faq.question || faq.q || "FAQ",
+      text: [faq.question, faq.answer].filter(Boolean).join(" \n "),
+    });
+  }
+
+  const genericKeys = [
+    "services",
+    "packages",
+    "pricing",
+    "pricing_cards",
+    "offers_by_category",
+    "inventory",
+  ];
+
+  for (const key of genericKeys) {
+    for (const entry of asArray(structuredData[key])) {
+      pushCandidate(items, {
+        kind: key,
+        url: entry.url || entry.link || "",
+        title: entry.title || entry.name || key,
+        text: stringifySafe(entry),
       });
     }
   }
 
-  return results
+  return items;
+}
+
+function searchStructuredData(structuredData, query, limit = 8) {
+  const tokens = tokenise(query);
+  const queryDims = extractDimensionTokens(query);
+  const intent = inferIntent(tokens);
+  const candidates = flattenStructuredData(structuredData);
+
+  const scored = [];
+  for (const candidate of candidates) {
+    const { score, matched } = scoreCandidate(candidate, tokens, queryDims, intent);
+    if (score <= 0) continue;
+
+    scored.push({
+      source: "structured_data",
+      kind: candidate.kind,
+      url: candidate.url,
+      title: candidate.title,
+      subtitle: candidate.subtitle,
+      score,
+      matched,
+      excerpts: [makeExcerpt(candidate.searchText, matched.length ? matched : tokens)],
+    });
+  }
+
+  return scored
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 }
 
-/**
- * Search the SUMMARY text of a session.
- */
-function searchSummary(summary, keywords) {
-  if (!summary) return [];
-  const { score, excerpts } = scoreText(summary, keywords);
-  if (score === 0) return [];
-  return [{ source: "summary", score, excerpts }];
+function searchSummary(summary, query) {
+  const tokens = tokenise(query);
+  if (!summary || !tokens.length) return [];
+
+  const hay = normalizeText(summary);
+  let score = 0;
+  const matched = [];
+  for (const token of tokens) {
+    if (hay.includes(token)) {
+      score += token.length >= 5 ? 2 : 1;
+      matched.push(token);
+    }
+  }
+
+  if (!score) return [];
+  return [{
+    source: "summary",
+    kind: "summary",
+    score,
+    matched,
+    excerpts: [makeExcerpt(summary, matched.length ? matched : tokens, 260)],
+  }];
 }
 
-// ── Live fetch fallback ───────────────────────────────────────────────────────
-async function liveFetch(siteUrl, keywords, limit = 3) {
+async function liveFetch(siteUrl, query, limit = 3) {
   try {
+    const tokens = tokenise(query);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6000);
     const res = await fetch(siteUrl, {
       signal: controller.signal,
-      headers: { "User-Agent": "NEO-SearchWorker/1.0" },
+      headers: { "User-Agent": "NEO-SearchWorker/2.0" },
     });
     clearTimeout(timer);
     if (!res.ok) return [];
+
     const html = await res.text();
-    // Strip tags, decode entities crudely
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
       .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -132,18 +345,43 @@ async function liveFetch(siteUrl, keywords, limit = 3) {
       .replace(/&amp;/g, "&")
       .replace(/\s{2,}/g, " ");
 
-    const { score, excerpts } = scoreText(text, keywords);
-    if (score === 0) return [];
-    return [{ source: "live_fetch", url: siteUrl, score, excerpts: excerpts.slice(0, limit) }];
+    const hay = normalizeText(text);
+    let score = 0;
+    const matched = [];
+    for (const token of tokens) {
+      if (hay.includes(token)) {
+        score += 1;
+        matched.push(token);
+      }
+    }
+
+    if (!score) return [];
+    return [{
+      source: "live_fetch",
+      kind: "live_fetch",
+      url: siteUrl,
+      score,
+      matched,
+      excerpts: [makeExcerpt(text, matched.length ? matched : tokens, 220)],
+    }].slice(0, limit);
   } catch {
     return [];
   }
 }
 
-// ── Main search endpoint ──────────────────────────────────────────────────────
-// POST /search
-// Body: { session_id, query, site_url? }
-// Returns: { results[], keywords[], elapsed_ms }
+function dedupeResults(results, limit = 8) {
+  const seen = new Set();
+  return results
+    .filter((r) => {
+      const key = [r.source, r.kind, r.url || "", r.title || "", (r.excerpts || [])[0] || ""].join("|");
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
 app.post("/search", async (req, reply) => {
   const t0 = Date.now();
   const { session_id, query, site_url } = req.body ?? {};
@@ -160,7 +398,6 @@ app.post("/search", async (req, reply) => {
   const supabase = getSupabase();
   let results = [];
 
-  // 1️⃣ Fetch session from Supabase
   const { data: session, error } = await supabase
     .from("demo_sessions")
     .select("summary, structured_data, url")
@@ -170,37 +407,26 @@ app.post("/search", async (req, reply) => {
   if (error || !session) {
     app.log.warn({ session_id, error: error?.message }, "Session not found");
   } else {
-    const pages = session.structured_data?.pages ?? [];
-    const summary = session.structured_data?.cleaned_summary ?? session.summary ?? "";
+    const structuredData = session.structured_data ?? {};
+    const summary = structuredData.cleaned_summary ?? session.summary ?? "";
     const sessionSiteUrl = site_url || session.url || "";
 
-    // 2️⃣ Search summary
-    const summaryHits = searchSummary(summary, keywords);
-    results.push(...summaryHits);
+    const structuredHits = searchStructuredData(structuredData, query, 8);
+    results.push(...structuredHits);
 
-    // 3️⃣ Search crawled pages
-    const pageHits = searchPages(pages, keywords, 8);
-    results.push(...pageHits);
+    if (results.length < 3) {
+      const summaryHits = searchSummary(summary, query);
+      results.push(...summaryHits);
+    }
 
-    // 4️⃣ If no results and we have a site URL → live fetch
     if (results.length === 0 && sessionSiteUrl) {
       app.log.info({ sessionSiteUrl, keywords }, "No local results — trying live fetch");
-      const liveHits = await liveFetch(sessionSiteUrl, keywords, 3);
+      const liveHits = await liveFetch(sessionSiteUrl, query, 3);
       results.push(...liveHits);
     }
   }
 
-  // Deduplicate and sort by score
-  const seen = new Set();
-  const deduped = results
-    .filter((r) => {
-      const key = r.url ?? r.source ?? "";
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 6);
+  const deduped = dedupeResults(results, 8);
 
   return reply.send({
     results: deduped,
@@ -209,9 +435,7 @@ app.post("/search", async (req, reply) => {
   });
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", async () => ({ status: "ok", ts: Date.now() }));
 
-// ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT ?? "3210");
 await app.listen({ port: PORT, host: "0.0.0.0" });
