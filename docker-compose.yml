@@ -13,7 +13,8 @@ services:
       SUPABASE_URL: "${SUPABASE_URL}"
       SUPABASE_SERVICE_ROLE_KEY: "${SUPABASE_SERVICE_ROLE_KEY}"
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3210/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3210/health >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 20s
