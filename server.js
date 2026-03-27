@@ -1,13 +1,17 @@
 import Fastify from "fastify";
 import { createClient } from "@supabase/supabase-js";
 
-const app = Fastify({ logger: true });
+const app = Fastify({
+  logger: true,
+  bodyLimit: 1024 * 1024,
+});
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
 app.addHook("preHandler", async (req, reply) => {
   if (req.url === "/health") return;
+
   const auth = req.headers["authorization"] ?? "";
   if (!WORKER_SECRET || auth !== `Bearer ${WORKER_SECRET}`) {
     return reply.code(401).send({ error: "Unauthorized" });
@@ -15,11 +19,23 @@ app.addHook("preHandler", async (req, reply) => {
 });
 
 // ── Supabase client ───────────────────────────────────────────────────────────
+let supabaseSingleton = null;
+
 function getSupabase() {
+  if (supabaseSingleton) return supabaseSingleton;
+
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-  return createClient(url, key);
+
+  if (!url || !key) {
+    throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  }
+
+  supabaseSingleton = createClient(url, key, {
+    auth: { persistSession: false },
+  });
+
+  return supabaseSingleton;
 }
 
 // ── Generic query understanding helpers ──────────────────────────────────────
@@ -74,10 +90,12 @@ function parseDimensions(query) {
   const dims = [];
   const re = /(\d{1,4})\s*(?:x|на)\s*(\d{1,4})(?:\s*(см|cm|мм|mm|m))?/g;
   let m;
+
   while ((m = re.exec(q))) {
     const a = m[1];
     const b = m[2];
     const unit = m[3] || "";
+
     dims.push({
       a,
       b,
@@ -94,6 +112,7 @@ function parseDimensions(query) {
       ].filter(Boolean))],
     });
   }
+
   return dims;
 }
 
@@ -101,7 +120,8 @@ function buildIntent(query) {
   const normalized = normalizeText(query);
   const tokens = tokenise(query);
   const dimensions = parseDimensions(query);
-  const productish = PRODUCTISH_HINTS.some((h) => normalized.includes(h)) || dimensions.length > 0;
+  const productish =
+    PRODUCTISH_HINTS.some((h) => normalized.includes(h)) || dimensions.length > 0;
 
   return {
     raw: String(query ?? ""),
@@ -113,9 +133,10 @@ function buildIntent(query) {
 }
 
 function excerptAround(text, idx, len = 160) {
+  const raw = String(text ?? "");
   const start = Math.max(0, idx - len);
-  const end = Math.min(text.length, idx + len);
-  return text.slice(start, end).replace(/\s+/g, " ").trim();
+  const end = Math.min(raw.length, idx + len);
+  return raw.slice(start, end).replace(/\s+/g, " ").trim();
 }
 
 function addExcerpt(excerpts, value) {
@@ -161,7 +182,6 @@ function scoreDocument({ text, title = "", url = "", pageType = "general", inten
 
   const classification = classifyDocument({ title, url, pageType, text: fullText });
 
-  // Page-type prior
   score += PAGE_TYPE_WEIGHTS[String(pageType || "general").toLowerCase()] || 0;
 
   if (intent.productish) {
@@ -169,18 +189,17 @@ function scoreDocument({ text, title = "", url = "", pageType = "general", inten
     if (classification.kind === "faq") score -= 8;
   }
 
-  // Exact query phrase
   if (intent.normalized && lower.includes(intent.normalized)) {
     score += 60;
     matched.push(intent.normalized);
     addExcerpt(excerpts, excerptAround(fullText, Math.max(0, lower.indexOf(intent.normalized))));
   }
 
-  // Token hits with title/url boosts
   let tokenHits = 0;
   for (const token of intent.tokens) {
     const idx = lower.indexOf(token);
     if (idx === -1) continue;
+
     tokenHits += 1;
     matched.push(token);
 
@@ -194,14 +213,13 @@ function scoreDocument({ text, title = "", url = "", pageType = "general", inten
     addExcerpt(excerpts, excerptAround(fullText, Math.max(0, idx)));
   }
 
-  // Dense multi-token bonus
   if (tokenHits >= 2) score += tokenHits * 6;
   if (tokenHits >= 4) score += 14;
 
-  // Dimension handling
   let dimensionHits = 0;
   for (const dim of intent.dimensions) {
     let hit = false;
+
     for (const variant of dim.variants) {
       const idx = lower.indexOf(variant);
       if (idx !== -1) {
@@ -214,7 +232,6 @@ function scoreDocument({ text, title = "", url = "", pageType = "general", inten
       }
     }
 
-    // Partial dimension match: both numbers exist somewhere
     if (!hit && lower.includes(dim.a) && lower.includes(dim.b)) {
       dimensionHits += 1;
       score += 14;
@@ -222,13 +239,13 @@ function scoreDocument({ text, title = "", url = "", pageType = "general", inten
     }
   }
 
-  // Structured-source priors
   if (source === "structured") score += 8;
   if (source === "summary") score -= 4;
 
-  // Weak-match penalties
   if (intent.tokens.length >= 2 && tokenHits === 1) score -= 10;
-  if (intent.productish && classification.kind === "general" && tokenHits < 2 && dimensionHits === 0) score -= 16;
+  if (intent.productish && classification.kind === "general" && tokenHits < 2 && dimensionHits === 0) {
+    score -= 16;
+  }
 
   return {
     score,
@@ -240,35 +257,52 @@ function scoreDocument({ text, title = "", url = "", pageType = "general", inten
   };
 }
 
+function safeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function flattenValue(value) {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(flattenValue).filter(Boolean).join(" ");
+  }
+  if (typeof value === "object") {
+    return Object.values(value).map(flattenValue).filter(Boolean).join(" ");
+  }
+  return "";
+}
+
 function toSearchDocuments(session) {
   const docs = [];
   const structured = session?.structured_data ?? {};
   const summary = String(session?.summary ?? "");
-  const pageMap = structured?.page_map ?? structured?.pages ?? [];
+  const pageMap = safeArray(structured?.page_map ?? structured?.pages);
 
-  if (Array.isArray(pageMap)) {
-    for (const p of pageMap) {
-      const title = p?.title || p?.name || "";
-      const url = p?.url || p?.link || "";
-      const pageType = p?.page_type || p?.type || "general";
-      const text = [
-        p?.summary,
-        p?.content,
-        p?.text,
-        p?.description,
-        Array.isArray(p?.bullets) ? p.bullets.join(" ") : "",
-      ].filter(Boolean).join(" \n ");
+  for (const p of pageMap) {
+    const title = p?.title || p?.name || "";
+    const url = p?.url || p?.link || "";
+    const pageType = p?.page_type || p?.type || "general";
+    const text = [
+      p?.summary,
+      p?.content,
+      p?.text,
+      p?.description,
+      Array.isArray(p?.bullets) ? p.bullets.join(" ") : "",
+      flattenValue(p?.metadata),
+    ].filter(Boolean).join(" \n ");
 
-      if (title || url || text) {
-        docs.push({
-          id: `page:${url || title}`,
-          title,
-          url,
-          pageType,
-          text,
-          source: "structured",
-        });
-      }
+    if (title || url || text) {
+      docs.push({
+        id: `page:${url || title}`,
+        title,
+        url,
+        pageType,
+        text,
+        source: "structured",
+      });
     }
   }
 
@@ -279,6 +313,7 @@ function toSearchDocuments(session) {
     ["pricing", structured?.pricing],
     ["faq", structured?.faq],
     ["rooms", structured?.rooms],
+    ["categories", structured?.categories],
   ];
 
   for (const [sectionName, items] of sections) {
@@ -299,6 +334,7 @@ function toSearchDocuments(session) {
         item?.model,
         Array.isArray(item?.features) ? item.features.join(" ") : "",
         Array.isArray(item?.bullets) ? item.bullets.join(" ") : "",
+        flattenValue(item),
       ].filter(Boolean).join(" \n ");
 
       if (title || url || text) {
@@ -355,7 +391,7 @@ function rankDocuments(documents, intent) {
   const seen = new Set();
 
   for (const item of ranked) {
-    const key = `${item.url || ""}::${normalizeText(item.title || "")}`;
+    const key = `${item.url || ""}::${normalizeText(item.title || "")}::${item.source || ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
     deduped.push(item);
@@ -367,14 +403,17 @@ function rankDocuments(documents, intent) {
 
 function buildSearchResponse(results, intent, startedAt) {
   const top = results[0];
+
   const confidence = !top
     ? 0
     : Math.min(
         1,
-        (top.score >= 120 ? 0.94 :
-         top.score >= 90 ? 0.84 :
-         top.score >= 70 ? 0.72 :
-         top.score >= 50 ? 0.58 : 0.42)
+        (
+          top.score >= 120 ? 0.94 :
+          top.score >= 90 ? 0.84 :
+          top.score >= 70 ? 0.72 :
+          top.score >= 50 ? 0.58 : 0.42
+        )
       );
 
   const needs_clarification =
@@ -383,6 +422,7 @@ function buildSearchResponse(results, intent, startedAt) {
     (intent.productish && (top?.dimensionHits ?? 0) === 0 && intent.dimensions.length > 0);
 
   return {
+    ok: true,
     results: results.map((r) => ({
       title: r.title,
       url: r.url,
@@ -400,41 +440,86 @@ function buildSearchResponse(results, intent, startedAt) {
   };
 }
 
-app.get("/health", async () => ({ ok: true }));
+async function loadSessionById(supabase, sessionId) {
+  const attempts = [
+    () =>
+      supabase
+        .from("demo_sessions")
+        .select("id, site_url, summary, structured_data")
+        .eq("id", sessionId)
+        .maybeSingle(),
+
+    // fallback ако някъде schema е стар/смесен
+    () =>
+      supabase
+        .from("demo_sessions")
+        .select("*")
+        .eq("id", sessionId)
+        .maybeSingle(),
+  ];
+
+  let lastError = null;
+
+  for (const attempt of attempts) {
+    const { data, error } = await attempt();
+    if (!error && data) return data;
+    if (error) lastError = error;
+  }
+
+  if (lastError) {
+    throw new Error(lastError.message || "Failed to load session");
+  }
+
+  return null;
+}
+
+app.get("/health", async () => ({
+  ok: true,
+  service: "neo-search-worker",
+}));
 
 app.post("/search", async (req, reply) => {
   const startedAt = Date.now();
 
   try {
-    const body = req.body || {};
+    const body = req.body && typeof req.body === "object" ? req.body : {};
     const session_id = String(body.session_id || "").trim();
     const query = String(body.query || "").trim();
     const site_url = String(body.site_url || "").trim();
 
     if (!session_id || !query) {
-      return reply.code(400).send({ error: "session_id and query are required" });
+      return reply.code(400).send({
+        error: "session_id and query are required",
+      });
     }
 
     const supabase = getSupabase();
+    const session = await loadSessionById(supabase, session_id);
 
-    const { data: session, error } = await supabase
-      .from("demo_sessions")
-      .select("session_id, site_url, summary, structured_data")
-      .eq("session_id", session_id)
-      .single();
-
-    if (error || !session) {
+    if (!session) {
       return reply.code(404).send({
         error: "Session not found",
-        details: error?.message || null,
+        details: `No demo_sessions row found for id=${session_id}`,
       });
     }
 
     const intent = buildIntent(query);
     const docs = toSearchDocuments({
       ...session,
-      site_url: site_url || session.site_url,
+      site_url: site_url || session.site_url || "",
     });
+
+    if (!docs.length) {
+      return reply.send({
+        ok: true,
+        results: [],
+        confidence: 0,
+        needs_clarification: true,
+        intent,
+        elapsed_ms: Date.now() - startedAt,
+        warning: "Session has no searchable summary or structured_data",
+      });
+    }
 
     const ranked = rankDocuments(docs, intent);
     const response = buildSearchResponse(ranked, intent, startedAt);
@@ -442,6 +527,7 @@ app.post("/search", async (req, reply) => {
     return reply.send(response);
   } catch (err) {
     req.log.error(err, "search failed");
+
     return reply.code(500).send({
       error: "Search failed",
       details: err instanceof Error ? err.message : String(err),
@@ -450,6 +536,7 @@ app.post("/search", async (req, reply) => {
 });
 
 const port = Number(process.env.PORT || 3210);
+
 app.listen({ port, host: "0.0.0.0" }).then(() => {
   app.log.info(`neo-search-worker listening on :${port}`);
 });
