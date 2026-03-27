@@ -4,11 +4,10 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.43.4",
-    "fastify": "^4.27.0"
+    "@supabase/supabase-js": "^2.56.0",
+    "fastify": "^5.0.0"
   }
 }
