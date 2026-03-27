@@ -3,16 +3,18 @@ import { createClient } from "@supabase/supabase-js";
 
 const app = Fastify({ logger: true });
 
+// ── Auth middleware ───────────────────────────────────────────────────────────
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
 app.addHook("preHandler", async (req, reply) => {
   if (req.url === "/health") return;
   const auth = req.headers["authorization"] ?? "";
   if (!WORKER_SECRET || auth !== `Bearer ${WORKER_SECRET}`) {
-    reply.code(401).send({ error: "Unauthorized" });
+    return reply.code(401).send({ error: "Unauthorized" });
   }
 });
 
+// ── Supabase client ───────────────────────────────────────────────────────────
 function getSupabase() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -20,422 +22,434 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-function asArray(v) {
-  return Array.isArray(v) ? v : [];
-}
+// ── Generic query understanding helpers ──────────────────────────────────────
+const STOP = new Set([
+  "и", "в", "на", "се", "за", "от", "с", "е", "да", "не", "ли", "но", "а", "или",
+  "как", "какво", "кой", "коя", "кои", "ще", "сте", "има", "имате", "при", "до", "по",
+  "искам", "търся", "търси", "потърси", "кажи", "покажи", "дали", "може", "можете", "моля",
+  "the", "a", "an", "of", "in", "is", "for", "to", "what", "how", "with", "and", "or",
+  "show", "find", "search", "tell", "about", "have", "any", "please",
+]);
+
+const PRODUCTISH_HINTS = [
+  "цена", "цени", "размер", "размери", "модел", "налич", "брой", "цвят", "материал",
+  "купя", "продукт", "продукти", "артикул", "см", "mm", "мм", "cm", "x",
+  "price", "prices", "size", "sizes", "model", "stock", "buy", "product", "products",
+];
+
+const PAGE_TYPE_WEIGHTS = {
+  product: 20,
+  products: 20,
+  category: 10,
+  collection: 10,
+  listing: 10,
+  service: 8,
+  package: 8,
+  booking: 8,
+  general: 0,
+};
 
 function normalizeText(value) {
   return String(value ?? "")
     .toLowerCase()
-    .replace(/×/g, "x")
-    .replace(/\bсм\.?\b/giu, " cm ")
-    .replace(/[^\p{L}\p{N}\s.x-]+/gu, " ")
+    .normalize("NFKC")
+    .replace(/[“”„"'`´]/g, " ")
+    .replace(/[–—−]/g, "-")
+    .replace(/[×х]/g, "x")
+    .replace(/[()\[\]{}|/\\,:;!?]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
 function tokenise(query) {
-  const STOP = new Set([
-    "и", "в", "на", "се", "за", "от", "с", "е", "да", "не", "ли",
-    "но", "а", "или", "как", "що", "ще", "сте", "има", "при", "до",
-    "искам", "търся", "търсите", "търсяте", "кажи", "кажете", "покажи", "дай",
-    "има", "ако", "като", "about", "the", "a", "an", "of", "in", "is",
-    "for", "to", "what", "how", "with", "have", "has",
-  ]);
-
-  const base = normalizeText(query)
-    .split(/\s+/)
-    .filter((w) => w.length >= 2 && !STOP.has(w));
-
-  const dims = extractDimensionTokens(query);
-  return [...new Set([...base, ...dims])];
+  return [...new Set(
+    normalizeText(query)
+      .split(/\s+/)
+      .filter((w) => w.length >= 2 && !STOP.has(w))
+  )];
 }
 
-function extractDimensionTokens(text) {
-  const out = new Set();
-  const raw = String(text ?? "").toLowerCase().replace(/×/g, "x");
-
-  for (const m of raw.matchAll(/\b(\d{1,4})\s*[xх]\s*(\d{1,4})\b/gu)) {
-    out.add(`${m[1]}x${m[2]}`);
-    out.add(`${m[1]} ${m[2]}`);
+function parseDimensions(query) {
+  const q = normalizeText(query);
+  const dims = [];
+  const re = /(\d{1,4})\s*(?:x|на)\s*(\d{1,4})(?:\s*(см|cm|мм|mm|m))?/g;
+  let m;
+  while ((m = re.exec(q))) {
+    const a = m[1];
+    const b = m[2];
+    const unit = m[3] || "";
+    dims.push({
+      a,
+      b,
+      unit,
+      canonical: `${a}x${b}${unit ? unit : ""}`,
+      variants: [...new Set([
+        `${a}x${b}`,
+        `${a} x ${b}`,
+        `${a} на ${b}`,
+        `${a}/${b}`,
+        unit ? `${a}x${b}${unit}` : "",
+        unit ? `${a} x ${b} ${unit}` : "",
+        unit ? `${a} ${unit} x ${b} ${unit}` : "",
+      ].filter(Boolean))],
+    });
   }
-
-  for (const m of raw.matchAll(/\b(\d{1,4})\s+на\s+(\d{1,4})\b/gu)) {
-    out.add(`${m[1]}x${m[2]}`);
-    out.add(`${m[1]} ${m[2]}`);
-  }
-
-  return [...out];
+  return dims;
 }
 
-function inferIntent(tokens) {
-  const set = new Set(tokens);
+function buildIntent(query) {
+  const normalized = normalizeText(query);
+  const tokens = tokenise(query);
+  const dimensions = parseDimensions(query);
+  const productish = PRODUCTISH_HINTS.some((h) => normalized.includes(h)) || dimensions.length > 0;
+
   return {
-    wantsCarpet: ["килим", "килими", "пътека", "пътеки", "runner", "carpet", "rug"].some((t) => set.has(t)),
-    wantsFurniture: ["гардероб", "легло", "диван", "маса", "стол"].some((t) => set.has(t)),
-    wantsPromo: ["промо", "промоция", "намаление", "оферта", "offers", "sale"].some((t) => set.has(t)),
+    raw: String(query ?? ""),
+    normalized,
+    tokens,
+    dimensions,
+    productish,
   };
 }
 
-function stringifySafe(value) {
-  try {
-    return JSON.stringify(value ?? {});
-  } catch {
-    return "";
-  }
+function excerptAround(text, idx, len = 160) {
+  const start = Math.max(0, idx - len);
+  const end = Math.min(text.length, idx + len);
+  return text.slice(start, end).replace(/\s+/g, " ").trim();
 }
 
-function makeExcerpt(text, tokens, maxLen = 220) {
-  const original = String(text ?? "").replace(/\s+/g, " ").trim();
-  if (!original) return "";
-  const lower = normalizeText(original);
+function addExcerpt(excerpts, value) {
+  if (!value) return;
+  if (!excerpts.includes(value)) excerpts.push(value);
+}
 
-  let bestIdx = 0;
-  for (const token of tokens) {
+function classifyDocument({ title, url, pageType, text }) {
+  const hay = normalizeText(`${title || ""} ${url || ""} ${pageType || ""} ${text || ""}`);
+
+  const productSignals = [
+    /\b(product|products|shop|sku|ean|модел|артикул|купи|добави в количката|цена|лв|€|eur|usd|налич)/,
+    /\b(размер|размери|см|cm|мм|mm|цвят|материал|марка|бренд)/,
+  ];
+
+  const serviceSignals = [
+    /\b(service|services|услуга|услуги|процедура|package|packages|пакет|пакети|лечение|консултация)/,
+  ];
+
+  const faqSignals = [
+    /\b(faq|въпроси|често задавани|questions|answers)/,
+  ];
+
+  const bookingSignals = [
+    /\b(book|booking|reserve|reservation|резервац|настаняване|нощувк|check-in|check out)/,
+  ];
+
+  let kind = "general";
+  if (productSignals.some((re) => re.test(hay))) kind = "productish";
+  else if (bookingSignals.some((re) => re.test(hay))) kind = "booking";
+  else if (serviceSignals.some((re) => re.test(hay))) kind = "service";
+  else if (faqSignals.some((re) => re.test(hay))) kind = "faq";
+
+  return { kind };
+}
+
+function scoreDocument({ text, title = "", url = "", pageType = "general", intent, source = "page" }) {
+  const fullText = String(text ?? "");
+  const lower = normalizeText(`${title} ${url} ${pageType} ${fullText}`);
+  const excerpts = [];
+  const matched = [];
+  let score = 0;
+
+  const classification = classifyDocument({ title, url, pageType, text: fullText });
+
+  // Page-type prior
+  score += PAGE_TYPE_WEIGHTS[String(pageType || "general").toLowerCase()] || 0;
+
+  if (intent.productish) {
+    if (classification.kind === "productish") score += 18;
+    if (classification.kind === "faq") score -= 8;
+  }
+
+  // Exact query phrase
+  if (intent.normalized && lower.includes(intent.normalized)) {
+    score += 60;
+    matched.push(intent.normalized);
+    addExcerpt(excerpts, excerptAround(fullText, Math.max(0, lower.indexOf(intent.normalized))));
+  }
+
+  // Token hits with title/url boosts
+  let tokenHits = 0;
+  for (const token of intent.tokens) {
     const idx = lower.indexOf(token);
-    if (idx !== -1) {
-      bestIdx = idx;
-      break;
-    }
+    if (idx === -1) continue;
+    tokenHits += 1;
+    matched.push(token);
+
+    const titleNorm = normalizeText(title);
+    const urlNorm = normalizeText(url);
+
+    if (titleNorm.includes(token)) score += 16;
+    else if (urlNorm.includes(token)) score += 12;
+    else score += 7;
+
+    addExcerpt(excerpts, excerptAround(fullText, Math.max(0, idx)));
   }
 
-  const start = Math.max(0, bestIdx - 80);
-  const end = Math.min(original.length, start + maxLen);
-  return original.slice(start, end).trim();
-}
+  // Dense multi-token bonus
+  if (tokenHits >= 2) score += tokenHits * 6;
+  if (tokenHits >= 4) score += 14;
 
-function scoreCandidate(candidate, tokens, queryDims, intent) {
-  const hay = normalizeText(candidate.searchText);
-  if (!hay) return { score: 0, matched: [] };
-
-  let score = 0;
-  const matched = [];
-
-  for (const token of tokens) {
-    if (!token) continue;
-    if (hay.includes(token)) {
-      score += token.length >= 5 ? 3 : 2;
-      matched.push(token);
-    }
-  }
-
-  for (const dim of queryDims) {
-    if (hay.includes(dim)) {
-      score += 6;
-      matched.push(dim);
-    }
-  }
-
-  if (candidate.kind === "product") score += 4;
-  if (candidate.kind === "category") score += 2;
-  if (candidate.kind === "page") score += 1;
-
-  const title = normalizeText(candidate.title);
-  const url = normalizeText(candidate.url);
-
-  if (intent.wantsCarpet) {
-    if (hay.includes("килим") || hay.includes("пътека") || title.includes("килим") || title.includes("пътека") || url.includes("kilim") || url.includes("carpet")) {
-      score += 8;
-    } else {
-      score -= 6;
-    }
-  }
-
-  if (intent.wantsFurniture) {
-    if (hay.includes("гардероб") || hay.includes("легло") || hay.includes("диван")) score += 8;
-  }
-
-  if (intent.wantsPromo && (hay.includes("промо") || hay.includes("намал") || url.includes("promotions"))) {
-    score += 5;
-  }
-
-  if (candidate.kind === "summary") score -= 4;
-  if (candidate.kind === "page" && url.includes("/promotions")) score -= 2;
-
-  return { score, matched: [...new Set(matched)] };
-}
-
-function pushCandidate(list, candidate) {
-  const searchText = [candidate.title, candidate.subtitle, candidate.text, candidate.metaText, candidate.url]
-    .filter(Boolean)
-    .join(" \n ");
-
-  if (!searchText.trim()) return;
-
-  list.push({
-    kind: candidate.kind || "block",
-    url: candidate.url || "",
-    title: candidate.title || "",
-    subtitle: candidate.subtitle || "",
-    text: candidate.text || "",
-    metaText: candidate.metaText || "",
-    searchText,
-  });
-}
-
-function flattenStructuredData(structuredData) {
-  const items = [];
-  if (!structuredData || typeof structuredData !== "object") return items;
-
-  const pages = asArray(structuredData.pages);
-  for (const page of pages) {
-    const pageText = [
-      page.title,
-      page.url,
-      page.pageType,
-      page.content,
-      stringifySafe(page.structured),
-    ].filter(Boolean).join(" \n ");
-
-    pushCandidate(items, {
-      kind: "page",
-      url: page.url,
-      title: page.title || page.pageType || "Page",
-      text: pageText,
-    });
-  }
-
-  const sections = asArray(structuredData.sections);
-  for (const section of sections) {
-    pushCandidate(items, {
-      kind: "section",
-      url: section.url || "",
-      title: section.title || section.name || "Section",
-      subtitle: section.type || "",
-      text: stringifySafe(section),
-    });
-  }
-
-  const products = [
-    ...asArray(structuredData.products),
-    ...asArray(structuredData.catalog_products),
-    ...asArray(structuredData.featured_products),
-    ...asArray(structuredData.promotions),
-    ...asArray(structuredData.offers),
-  ];
-
-  for (const product of products) {
-    pushCandidate(items, {
-      kind: "product",
-      url: product.url || product.link || "",
-      title: product.title || product.name || product.product_name || "Product",
-      subtitle: [product.category, product.brand, product.color, product.size].filter(Boolean).join(" • "),
-      text: stringifySafe(product),
-      metaText: [product.price, product.currency, product.sku].filter(Boolean).join(" "),
-    });
-  }
-
-  const categories = [
-    ...asArray(structuredData.categories),
-    ...asArray(structuredData.catalog_categories),
-    ...asArray(structuredData.navigation),
-  ];
-
-  for (const cat of categories) {
-    pushCandidate(items, {
-      kind: "category",
-      url: cat.url || cat.link || "",
-      title: cat.title || cat.name || cat.label || "Category",
-      text: stringifySafe(cat),
-    });
-  }
-
-  const faqs = asArray(structuredData.faq || structuredData.faqs);
-  for (const faq of faqs) {
-    pushCandidate(items, {
-      kind: "faq",
-      title: faq.question || faq.q || "FAQ",
-      text: [faq.question, faq.answer].filter(Boolean).join(" \n "),
-    });
-  }
-
-  const genericKeys = [
-    "services",
-    "packages",
-    "pricing",
-    "pricing_cards",
-    "offers_by_category",
-    "inventory",
-  ];
-
-  for (const key of genericKeys) {
-    for (const entry of asArray(structuredData[key])) {
-      pushCandidate(items, {
-        kind: key,
-        url: entry.url || entry.link || "",
-        title: entry.title || entry.name || key,
-        text: stringifySafe(entry),
-      });
-    }
-  }
-
-  return items;
-}
-
-function searchStructuredData(structuredData, query, limit = 8) {
-  const tokens = tokenise(query);
-  const queryDims = extractDimensionTokens(query);
-  const intent = inferIntent(tokens);
-  const candidates = flattenStructuredData(structuredData);
-
-  const scored = [];
-  for (const candidate of candidates) {
-    const { score, matched } = scoreCandidate(candidate, tokens, queryDims, intent);
-    if (score <= 0) continue;
-
-    scored.push({
-      source: "structured_data",
-      kind: candidate.kind,
-      url: candidate.url,
-      title: candidate.title,
-      subtitle: candidate.subtitle,
-      score,
-      matched,
-      excerpts: [makeExcerpt(candidate.searchText, matched.length ? matched : tokens)],
-    });
-  }
-
-  return scored
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
-}
-
-function searchSummary(summary, query) {
-  const tokens = tokenise(query);
-  if (!summary || !tokens.length) return [];
-
-  const hay = normalizeText(summary);
-  let score = 0;
-  const matched = [];
-  for (const token of tokens) {
-    if (hay.includes(token)) {
-      score += token.length >= 5 ? 2 : 1;
-      matched.push(token);
-    }
-  }
-
-  if (!score) return [];
-  return [{
-    source: "summary",
-    kind: "summary",
-    score,
-    matched,
-    excerpts: [makeExcerpt(summary, matched.length ? matched : tokens, 260)],
-  }];
-}
-
-async function liveFetch(siteUrl, query, limit = 3) {
-  try {
-    const tokens = tokenise(query);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
-    const res = await fetch(siteUrl, {
-      signal: controller.signal,
-      headers: { "User-Agent": "NEO-SearchWorker/2.0" },
-    });
-    clearTimeout(timer);
-    if (!res.ok) return [];
-
-    const html = await res.text();
-    const text = html
-      .replace(/<script[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style[\s\S]*?<\/style>/gi, " ")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/&nbsp;/g, " ")
-      .replace(/&amp;/g, "&")
-      .replace(/\s{2,}/g, " ");
-
-    const hay = normalizeText(text);
-    let score = 0;
-    const matched = [];
-    for (const token of tokens) {
-      if (hay.includes(token)) {
-        score += 1;
-        matched.push(token);
+  // Dimension handling
+  let dimensionHits = 0;
+  for (const dim of intent.dimensions) {
+    let hit = false;
+    for (const variant of dim.variants) {
+      const idx = lower.indexOf(variant);
+      if (idx !== -1) {
+        hit = true;
+        dimensionHits += 1;
+        score += 35;
+        matched.push(variant);
+        addExcerpt(excerpts, excerptAround(fullText, Math.max(0, idx)));
+        break;
       }
     }
 
-    if (!score) return [];
-    return [{
-      source: "live_fetch",
-      kind: "live_fetch",
-      url: siteUrl,
-      score,
-      matched,
-      excerpts: [makeExcerpt(text, matched.length ? matched : tokens, 220)],
-    }].slice(0, limit);
-  } catch {
-    return [];
+    // Partial dimension match: both numbers exist somewhere
+    if (!hit && lower.includes(dim.a) && lower.includes(dim.b)) {
+      dimensionHits += 1;
+      score += 14;
+      matched.push(`${dim.a}+${dim.b}`);
+    }
   }
+
+  // Structured-source priors
+  if (source === "structured") score += 8;
+  if (source === "summary") score -= 4;
+
+  // Weak-match penalties
+  if (intent.tokens.length >= 2 && tokenHits === 1) score -= 10;
+  if (intent.productish && classification.kind === "general" && tokenHits < 2 && dimensionHits === 0) score -= 16;
+
+  return {
+    score,
+    matched: [...new Set(matched)].slice(0, 12),
+    excerpts: excerpts.slice(0, 4),
+    classification,
+    tokenHits,
+    dimensionHits,
+  };
 }
 
-function dedupeResults(results, limit = 8) {
-  const seen = new Set();
-  return results
-    .filter((r) => {
-      const key = [r.source, r.kind, r.url || "", r.title || "", (r.excerpts || [])[0] || ""].join("|");
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+function toSearchDocuments(session) {
+  const docs = [];
+  const structured = session?.structured_data ?? {};
+  const summary = String(session?.summary ?? "");
+  const pageMap = structured?.page_map ?? structured?.pages ?? [];
+
+  if (Array.isArray(pageMap)) {
+    for (const p of pageMap) {
+      const title = p?.title || p?.name || "";
+      const url = p?.url || p?.link || "";
+      const pageType = p?.page_type || p?.type || "general";
+      const text = [
+        p?.summary,
+        p?.content,
+        p?.text,
+        p?.description,
+        Array.isArray(p?.bullets) ? p.bullets.join(" ") : "",
+      ].filter(Boolean).join(" \n ");
+
+      if (title || url || text) {
+        docs.push({
+          id: `page:${url || title}`,
+          title,
+          url,
+          pageType,
+          text,
+          source: "structured",
+        });
+      }
+    }
+  }
+
+  const sections = [
+    ["products", structured?.products],
+    ["services", structured?.services],
+    ["packages", structured?.packages],
+    ["pricing", structured?.pricing],
+    ["faq", structured?.faq],
+    ["rooms", structured?.rooms],
+  ];
+
+  for (const [sectionName, items] of sections) {
+    if (!Array.isArray(items)) continue;
+
+    for (const item of items) {
+      const title = item?.title || item?.name || item?.label || "";
+      const url = item?.url || item?.link || "";
+      const pageType = sectionName === "products" ? "product" : sectionName;
+      const text = [
+        item?.summary,
+        item?.description,
+        item?.details,
+        item?.price,
+        item?.price_text,
+        item?.availability,
+        item?.sku,
+        item?.model,
+        Array.isArray(item?.features) ? item.features.join(" ") : "",
+        Array.isArray(item?.bullets) ? item.bullets.join(" ") : "",
+      ].filter(Boolean).join(" \n ");
+
+      if (title || url || text) {
+        docs.push({
+          id: `${sectionName}:${url || title}`,
+          title,
+          url,
+          pageType,
+          text,
+          source: "structured",
+        });
+      }
+    }
+  }
+
+  if (summary) {
+    docs.push({
+      id: "summary:root",
+      title: session?.site_url || "Site summary",
+      url: session?.site_url || "",
+      pageType: "general",
+      text: summary,
+      source: "summary",
+    });
+  }
+
+  return docs;
 }
+
+function rankDocuments(documents, intent) {
+  const ranked = [];
+
+  for (const doc of documents) {
+    const scored = scoreDocument({
+      text: doc.text,
+      title: doc.title,
+      url: doc.url,
+      pageType: doc.pageType,
+      intent,
+      source: doc.source,
+    });
+
+    if (scored.score <= 0) continue;
+
+    ranked.push({
+      ...doc,
+      ...scored,
+    });
+  }
+
+  ranked.sort((a, b) => b.score - a.score);
+
+  const deduped = [];
+  const seen = new Set();
+
+  for (const item of ranked) {
+    const key = `${item.url || ""}::${normalizeText(item.title || "")}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+    if (deduped.length >= 8) break;
+  }
+
+  return deduped;
+}
+
+function buildSearchResponse(results, intent, startedAt) {
+  const top = results[0];
+  const confidence = !top
+    ? 0
+    : Math.min(
+        1,
+        (top.score >= 120 ? 0.94 :
+         top.score >= 90 ? 0.84 :
+         top.score >= 70 ? 0.72 :
+         top.score >= 50 ? 0.58 : 0.42)
+      );
+
+  const needs_clarification =
+    results.length === 0 ||
+    confidence < 0.6 ||
+    (intent.productish && (top?.dimensionHits ?? 0) === 0 && intent.dimensions.length > 0);
+
+  return {
+    results: results.map((r) => ({
+      title: r.title,
+      url: r.url,
+      page_type: r.pageType,
+      score: r.score,
+      matched: r.matched,
+      excerpts: r.excerpts,
+      source: r.source,
+      kind: r.classification?.kind || "general",
+    })),
+    confidence,
+    needs_clarification,
+    intent,
+    elapsed_ms: Date.now() - startedAt,
+  };
+}
+
+app.get("/health", async () => ({ ok: true }));
 
 app.post("/search", async (req, reply) => {
-  const t0 = Date.now();
-  const { session_id, query, site_url } = req.body ?? {};
+  const startedAt = Date.now();
 
-  if (!session_id || !query) {
-    return reply.code(400).send({ error: "session_id and query are required" });
-  }
+  try {
+    const body = req.body || {};
+    const session_id = String(body.session_id || "").trim();
+    const query = String(body.query || "").trim();
+    const site_url = String(body.site_url || "").trim();
 
-  const keywords = tokenise(query);
-  if (!keywords.length) {
-    return reply.send({ results: [], keywords, elapsed_ms: Date.now() - t0 });
-  }
-
-  const supabase = getSupabase();
-  let results = [];
-
-  const { data: session, error } = await supabase
-    .from("demo_sessions")
-    .select("summary, structured_data, url")
-    .eq("id", session_id)
-    .single();
-
-  if (error || !session) {
-    app.log.warn({ session_id, error: error?.message }, "Session not found");
-  } else {
-    const structuredData = session.structured_data ?? {};
-    const summary = structuredData.cleaned_summary ?? session.summary ?? "";
-    const sessionSiteUrl = site_url || session.url || "";
-
-    const structuredHits = searchStructuredData(structuredData, query, 8);
-    results.push(...structuredHits);
-
-    if (results.length < 3) {
-      const summaryHits = searchSummary(summary, query);
-      results.push(...summaryHits);
+    if (!session_id || !query) {
+      return reply.code(400).send({ error: "session_id and query are required" });
     }
 
-    if (results.length === 0 && sessionSiteUrl) {
-      app.log.info({ sessionSiteUrl, keywords }, "No local results — trying live fetch");
-      const liveHits = await liveFetch(sessionSiteUrl, query, 3);
-      results.push(...liveHits);
+    const supabase = getSupabase();
+
+    const { data: session, error } = await supabase
+      .from("demo_sessions")
+      .select("session_id, site_url, summary, structured_data")
+      .eq("session_id", session_id)
+      .single();
+
+    if (error || !session) {
+      return reply.code(404).send({
+        error: "Session not found",
+        details: error?.message || null,
+      });
     }
+
+    const intent = buildIntent(query);
+    const docs = toSearchDocuments({
+      ...session,
+      site_url: site_url || session.site_url,
+    });
+
+    const ranked = rankDocuments(docs, intent);
+    const response = buildSearchResponse(ranked, intent, startedAt);
+
+    return reply.send(response);
+  } catch (err) {
+    req.log.error(err, "search failed");
+    return reply.code(500).send({
+      error: "Search failed",
+      details: err instanceof Error ? err.message : String(err),
+    });
   }
-
-  const deduped = dedupeResults(results, 8);
-
-  return reply.send({
-    results: deduped,
-    keywords,
-    elapsed_ms: Date.now() - t0,
-  });
 });
 
-app.get("/health", async () => ({ status: "ok", ts: Date.now() }));
-
-const PORT = parseInt(process.env.PORT ?? "3210");
-await app.listen({ port: PORT, host: "0.0.0.0" });
+const port = Number(process.env.PORT || 3210);
+app.listen({ port, host: "0.0.0.0" }).then(() => {
+  app.log.info(`neo-search-worker listening on :${port}`);
+});
