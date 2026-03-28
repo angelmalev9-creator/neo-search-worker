@@ -211,7 +211,41 @@ async function trySearchOnSite(page, siteUrl, query, logger) {
   const origin = getOrigin(siteUrl);
 
   await page.goto(origin, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(800);
+
+  // ── Dismiss overlays that block clicks (cookie consent, newsletter popups) ──
+  await page.evaluate(() => {
+    // Remove Cookiebot overlay
+    document.querySelector('#CybotCookiebotDialog')?.remove();
+    document.querySelector('#CybotCookiebotDialogBodyUnderlay')?.remove();
+
+    // Try clicking common cookie accept buttons
+    const cookieBtns = document.querySelectorAll(
+      '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, ' +
+      '#CybotCookiebotDialogBodyButtonAccept, ' +
+      '[id*="cookie" i] button, [class*="cookie" i] button, ' +
+      'button[class*="accept" i], button[class*="agree" i], ' +
+      'a[class*="accept" i], a[class*="agree" i]'
+    );
+    for (const btn of cookieBtns) { try { btn.click(); } catch {} }
+
+    // Remove newsletter/modal popups
+    document.querySelectorAll(
+      '.modal.show, [class*="newsletter" i].show, [class*="popup" i].show, ' +
+      '[class*="modal-subscribe"], [class*="pop-up"]'
+    ).forEach(el => el.remove());
+
+    // Remove any remaining overlays/backdrops
+    document.querySelectorAll(
+      '.modal-backdrop, [class*="overlay" i], [class*="underlay" i]'
+    ).forEach(el => el.remove());
+
+    // Reset body scroll locks
+    document.body.style.overflow = '';
+    document.body.classList.remove('modal-open', 'no-scroll');
+  }).catch(() => {});
+
+  await page.waitForTimeout(300);
 
   const searchSelectors = [
     'input[type="search"]',
@@ -237,14 +271,21 @@ async function trySearchOnSite(page, siteUrl, query, logger) {
       // Click search icon/toggle to reveal it
       const toggle = await page.$('[class*="search" i] button, [class*="search" i] a, button[aria-label*="search" i], .search-toggle, .search-icon');
       if (toggle) {
-        await toggle.click().catch(() => {});
+        await toggle.click({ force: true, timeout: 2000 }).catch(() => {});
         await page.waitForTimeout(400);
       }
       visible = await input.isVisible().catch(() => false);
       if (!visible) continue;
     }
 
-    await input.click();
+    // Use force:true to bypass any remaining overlay issues
+    try {
+      await input.click({ force: true, timeout: 2000 });
+    } catch {
+      // If click still fails, try focus via JS
+      await page.evaluate((s) => document.querySelector(s)?.focus(), sel).catch(() => {});
+    }
+
     await input.fill(query);
     await page.waitForTimeout(200);
     await input.press("Enter");
