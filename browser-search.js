@@ -41,7 +41,6 @@ async function getBrowser() {
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--disable-extensions",
-      "--single-process",
       "--no-zygote",
     ],
   });
