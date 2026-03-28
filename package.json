@@ -1,14 +1,12 @@
 {
   "name": "neo-search-worker",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "version": "2.0.0",
+  "description": "Optimized Bing Search Worker",
+  "main": "index.js",
   "dependencies": {
-    "@supabase/supabase-js": "^2.56.0",
-    "fastify": "^5.0.0",
-    "playwright": "^1.52.0"
+    "express": "^4.18.2",
+    "puppeteer": "^21.5.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   }
 }
