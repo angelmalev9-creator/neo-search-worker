@@ -30,12 +30,17 @@ function unique(arr) {
   return [...new Set((Array.isArray(arr) ? arr : []).filter(Boolean))];
 }
 
+function maxLinksSafe(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return 5;
+  return Math.min(n, 10);
+}
+
 function extractPriceMatches(text) {
   const source = normalizeWhitespace(text);
   if (!source) return [];
 
-  const regex =
-    /\b\d{1,5}(?:[.,]\d{1,2})?\s?(?:лв\.?|lv|eur|€)\b/gi;
+  const regex = /\b\d{1,5}(?:[.,]\d{1,2})?\s?(?:лв\.?|lv|eur|€)\b/gi;
 
   const matches = [];
   let match;
@@ -57,14 +62,10 @@ function buildSearchQueries(domain, query) {
 
 function buildSearchUrl(engine, searchQuery) {
   if (engine === "google") {
-    return `https://www.google.com/search?q=${encodeURIComponent(
-      searchQuery
-    )}&hl=bg&num=10`;
+    return `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&hl=bg&num=10`;
   }
 
-  return `https://www.bing.com/search?q=${encodeURIComponent(
-    searchQuery
-  )}&setlang=bg-BG`;
+  return `https://www.bing.com/search?q=${encodeURIComponent(searchQuery)}&setlang=bg-BG`;
 }
 
 function resetIdleTimer() {
@@ -101,17 +102,15 @@ async function getContext() {
   if (!contextPromise) {
     const browser = await getBrowser();
 
-    contextPromise = browser
-      .newContext({
-        userAgent:
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        viewport: { width: 1366, height: 900 },
-        locale: "bg-BG",
-      })
-      .catch((err) => {
-        contextPromise = null;
-        throw err;
-      });
+    contextPromise = browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      viewport: { width: 1366, height: 900 },
+      locale: "bg-BG",
+    }).catch((err) => {
+      contextPromise = null;
+      throw err;
+    });
   }
 
   resetIdleTimer();
@@ -121,14 +120,13 @@ async function getContext() {
 async function extractEngineLinks(page, domain) {
   return page.evaluate(
     ({ expectedDomain, maxLinks }) => {
+      const normalizeHost = (host) => String(host || "").replace(/^www\./i, "");
+
       const isSameDomain = (href) => {
         try {
           const url = new URL(href);
-          const host = url.hostname.replace(/^www\./i, "");
-          return (
-            host === expectedDomain ||
-            host.endsWith(`.${expectedDomain}`)
-          );
+          const host = normalizeHost(url.hostname);
+          return host === expectedDomain || host.endsWith(`.${expectedDomain}`);
         } catch {
           return false;
         }
@@ -163,12 +161,6 @@ async function extractEngineLinks(page, domain) {
   );
 }
 
-function maxLinksSafe(value) {
-  const n = Number(value || 0);
-  if (!Number.isFinite(n) || n <= 0) return 5;
-  return Math.min(n, 10);
-}
-
 async function inspectResultPage(context, url, logger) {
   const page = await context.newPage();
   page.setDefaultTimeout(PAGE_TIMEOUT_MS);
@@ -198,6 +190,7 @@ async function inspectResultPage(context, url, logger) {
 
     const excerptSource =
       data.bodyText || data.description || data.h1 || data.title || "";
+
     const excerpt = buildExcerpt(excerptSource);
     const prices = extractPriceMatches(data.bodyText);
 
