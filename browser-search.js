@@ -1,6 +1,6 @@
 /**
  * browser-search.js — Live fallback for NEO Search Worker
- * Strategy: Search Engine -> Domain Filter -> Visit -> Extract
+ * Strategy: Search Engine -> Domain Filter -> Visit -> Universal Extract
  */
 import { chromium } from "playwright";
 
@@ -13,11 +13,19 @@ async function getBrowser() {
   if (_browser?.isConnected()) return _browser;
   _browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu"
+    ]
   });
   return _browser;
 }
 
+/**
+ * Main Fallback Function
+ */
 export async function browserSearch({ siteUrl, query, logger }) {
   const domain = new URL(siteUrl).hostname.replace("www.", "");
   const fullSearchQuery = `${domain} ${query}`;
@@ -27,50 +35,59 @@ export async function browserSearch({ siteUrl, query, logger }) {
   try {
     const browser = await getBrowser();
     context = await browser.newContext({
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      viewport: { width: 1280, height: 720 }
     });
     const page = await context.newPage();
 
-    // 1. Search Google/DuckDuckGo
-    logger.info({ fullSearchQuery }, "[browser-search] searching via google");
+    // 1. Search Google
+    logger.info({ fullSearchQuery }, "[browser-search] Querying Google");
     await page.goto(`${SEARCH_ENGINE_URL}${encodeURIComponent(fullSearchQuery)}`, {
       waitUntil: "domcontentloaded",
       timeout: 4000
     });
 
-    // 2. Extract top result matching domain
+    // 2. Extract first result matching domain
     const targetLink = await page.evaluate((targetDomain) => {
       const links = Array.from(document.querySelectorAll("a"));
       for (const link of links) {
         const href = link.href;
-        if (href.includes(targetDomain) && !href.includes("google.com")) {
+        // Avoid ads or Google internal links
+        if (href.includes(targetDomain) && !href.includes("google.com") && !href.includes("webcache")) {
           return href;
         }
       }
       return null;
     }, domain);
 
-    if (!targetLink) throw new Error("No domain-specific results found on search engine");
+    if (!targetLink) throw new Error(`No results for ${domain} found on Google`);
 
-    // 3. Visit first relevant result
-    logger.info({ targetLink }, "[browser-search] visiting best result");
+    // 3. Visit the product page
+    logger.info({ targetLink }, "[browser-search] Visiting direct link");
     await page.goto(targetLink, { waitUntil: "domcontentloaded", timeout: 4000 });
 
-    // 4. Universal Extraction
+    // 4. Universal Extraction Logic (No hardcoding)
     const productData = await page.evaluate(() => {
       const findPrice = () => {
-        const priceRegex = /([0-9]+[.,][0-9]{2})\s?(лв|lv|BGN|€|\$)/i;
+        // Regex for BGN, Euro, USD, and generic digits
+        const priceRegex = /([0-9]{1,6}[.,][0-9]{2})\s?(лв|lv|BGN|€|\$)/i;
         const text = document.body.innerText;
         const match = text.match(priceRegex);
         return match ? match[0] : null;
+      };
+
+      const getAvailability = () => {
+        const text = document.body.innerText.toLowerCase();
+        if (text.includes("в наличност") || text.includes("in stock")) return "In Stock";
+        if (text.includes("изчерпан") || text.includes("out of stock")) return "Out of Stock";
+        return "Check Site";
       };
 
       return {
         title: document.querySelector("h1")?.innerText?.trim() || document.title,
         price: findPrice(),
         description: document.querySelector('meta[name="description"]')?.content || "",
-        availability: document.body.innerText.toLowerCase().includes("наличност") || 
-                      document.body.innerText.toLowerCase().includes("stock") ? "In Stock" : "Check site",
+        availability: getAvailability()
       };
     });
 
@@ -88,7 +105,7 @@ export async function browserSearch({ siteUrl, query, logger }) {
     };
 
   } catch (err) {
-    logger.error({ error: err.message }, "[browser-search] fallback failed");
+    logger.error({ error: err.message }, "[browser-search] Fallback failed");
     return { ok: false, results: [], reason: err.message };
   } finally {
     if (context) await context.close().catch(() => {});
@@ -96,9 +113,10 @@ export async function browserSearch({ siteUrl, query, logger }) {
 }
 
 export async function browserSearchWithRetry(opts) {
-  const res = await browserSearch(opts);
-  if (res.ok) return res;
-  opts.logger.warn("[browser-search] retry 1/1 triggered");
+  const firstAttempt = await browserSearch(opts);
+  if (firstAttempt.ok && firstAttempt.results.length > 0) return firstAttempt;
+  
+  opts.logger.warn("[browser-search] Retry 1 triggered");
   return await browserSearch(opts);
 }
 
