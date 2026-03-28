@@ -1,39 +1,32 @@
 /**
- * browser-search.js — Live fallback search via headless browser
+ * browser-search.js — Live fallback: go directly to the site and search there.
  *
- * When structured_data lacks pricing or confidence is low,
- * this module performs a real Google search scoped to the site domain,
- * visits the top results, and extracts product data.
+ * Strategy (no Google — Google blocks headless bots):
+ *   1. Open site_url directly
+ *   2. Find the site's search input, type the query
+ *   3. Grab the first product links from results
+ *   4. Visit each, extract price/title/availability
  *
- * Design goals:
- *   - Max 8s total timeout per call (configurable)
- *   - 1 retry on failure
- *   - No heavy ML — pure DOM extraction
- *   - Universal (no site-specific selectors)
- *   - Safe — every await is guarded, browser always closes
+ * Fallback if no search bar found:
+ *   Try common URL patterns: /search?q=..., /catalogsearch/result/?q=..., etc.
  */
 
 import { chromium } from "playwright";
 
-// ── Configuration ──────────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
+const BROWSER_TIMEOUT_MS = parseInt(process.env.BROWSER_TIMEOUT_MS || "10000", 10);
+const NAV_TIMEOUT_MS = 6000;
+const MAX_PRODUCT_VISITS = 2;
 
-const BROWSER_TIMEOUT_MS = parseInt(process.env.BROWSER_TIMEOUT_MS || "8000", 10);
-const MAX_RESULTS_TO_VISIT = 3;
-const NAVIGATION_TIMEOUT_MS = 6000;
-const EXTRACT_TIMEOUT_MS = 4000;
-
-// ── Browser pool (reuse across requests) ───────────────────────────────────────
-
+// ── Browser singleton ─────────────────────────────────────────────────────────
 let _browser = null;
-let _browserLaunchPromise = null;
+let _launching = null;
 
 async function getBrowser() {
   if (_browser?.isConnected()) return _browser;
+  if (_launching) return _launching;
 
-  // Prevent concurrent launches
-  if (_browserLaunchPromise) return _browserLaunchPromise;
-
-  _browserLaunchPromise = chromium.launch({
+  _launching = chromium.launch({
     headless: true,
     args: [
       "--no-sandbox",
@@ -46,22 +39,14 @@ async function getBrowser() {
   });
 
   try {
-    _browser = await _browserLaunchPromise;
-
-    _browser.on("disconnected", () => {
-      _browser = null;
-      _browserLaunchPromise = null;
-    });
-
+    _browser = await _launching;
+    _browser.on("disconnected", () => { _browser = null; _launching = null; });
     return _browser;
   } finally {
-    _browserLaunchPromise = null;
+    _launching = null;
   }
 }
 
-/**
- * Gracefully shut down the shared browser (call on process exit).
- */
 export async function closeBrowser() {
   if (_browser?.isConnected()) {
     await _browser.close().catch(() => {});
@@ -69,423 +54,335 @@ export async function closeBrowser() {
   }
 }
 
-// ── Query builder ──────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/**
- * Build a Google-ready search query scoped to the site domain.
- *
- * @param {string} siteUrl  — e.g. "https://praktiker.bg"
- * @param {string} query    — user's raw query
- * @returns {string}
- */
-function buildSearchQuery(siteUrl, query) {
-  let domain = "";
-  try {
-    domain = new URL(siteUrl).hostname.replace(/^www\./, "");
-  } catch {
-    domain = siteUrl.replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0];
-  }
-  // site:domain + original query — Google narrows results to that domain
-  return `site:${domain} ${query}`;
+function getDomain(siteUrl) {
+  try { return new URL(siteUrl).hostname.replace(/^www\./, ""); }
+  catch { return siteUrl.replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0]; }
 }
 
-// ── Google SERP extraction ─────────────────────────────────────────────────────
-
-/**
- * Search Google and extract organic result links.
- * Returns up to `MAX_RESULTS_TO_VISIT` URLs from the target domain.
- */
-async function searchGoogle(page, searchQuery, targetDomain) {
-  const encodedQ = encodeURIComponent(searchQuery);
-  const url = `https://www.google.com/search?q=${encodedQ}&hl=bg&num=10`;
-
-  await page.goto(url, {
-    waitUntil: "domcontentloaded",
-    timeout: NAVIGATION_TIMEOUT_MS,
-  });
-
-  // Wait briefly for results to render
-  await page.waitForSelector("div#search", { timeout: 3000 }).catch(() => {});
-
-  const links = await page.evaluate((domain) => {
-    const anchors = document.querySelectorAll("div#search a[href]");
-    const results = [];
-    const seen = new Set();
-
-    for (const a of anchors) {
-      const href = a.href;
-      if (!href || href.includes("google.") || href.includes("webcache") || href.includes("translate.google")) continue;
-
-      // Extract clean URL
-      let cleanUrl = href;
-      try {
-        const u = new URL(href);
-        // Google sometimes wraps in /url?q=...
-        if (u.pathname === "/url" && u.searchParams.has("q")) {
-          cleanUrl = u.searchParams.get("q");
-        }
-      } catch { continue; }
-
-      if (seen.has(cleanUrl)) continue;
-      seen.add(cleanUrl);
-
-      // Prefer same-domain results
-      let isDomain = false;
-      try {
-        isDomain = new URL(cleanUrl).hostname.replace(/^www\./, "").includes(domain);
-      } catch { /* skip */ }
-
-      if (isDomain) {
-        // Get visible text near the link as a title hint
-        const title = a.textContent?.trim()?.slice(0, 200) || "";
-        results.push({ url: cleanUrl, title, onDomain: true });
-      }
-    }
-
-    // If no on-domain results, take any organic results
-    if (results.length === 0) {
-      for (const a of anchors) {
-        const href = a.href;
-        if (!href || href.includes("google.") || href.includes("webcache")) continue;
-        let cleanUrl = href;
-        try {
-          const u = new URL(href);
-          if (u.pathname === "/url" && u.searchParams.has("q")) {
-            cleanUrl = u.searchParams.get("q");
-          }
-        } catch { continue; }
-        if (seen.has(`off:${cleanUrl}`)) continue;
-        seen.add(`off:${cleanUrl}`);
-        const title = a.textContent?.trim()?.slice(0, 200) || "";
-        results.push({ url: cleanUrl, title, onDomain: false });
-        if (results.length >= 3) break;
-      }
-    }
-
-    return results;
-  }, targetDomain);
-
-  return links.slice(0, MAX_RESULTS_TO_VISIT);
+function getOrigin(siteUrl) {
+  try { return new URL(siteUrl).origin; }
+  catch { return `https://${getDomain(siteUrl)}`; }
 }
 
-// ── Product data extraction ────────────────────────────────────────────────────
-
 /**
- * Visit a product page and extract structured product info via DOM heuristics.
- * Works on arbitrary sites — no hardcoded selectors.
+ * Common search URL patterns used by e-commerce sites.
+ * We try these if we can't find or interact with a search input.
  */
-async function extractProductData(page, targetUrl) {
-  await page.goto(targetUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: NAVIGATION_TIMEOUT_MS,
-  });
+function buildSearchUrls(origin, query) {
+  const q = encodeURIComponent(query);
+  return [
+    `${origin}/search?q=${q}`,
+    `${origin}/catalogsearch/result/?q=${q}`,
+    `${origin}/search?keyword=${q}`,
+    `${origin}/search?text=${q}`,
+    `${origin}/search/${q}`,
+    `${origin}/?s=${q}`,
+    `${origin}/search?search=${q}`,
+  ];
+}
 
-  // Give JS-rendered content a brief moment
-  await page.waitForTimeout(800);
+// ── Product page extraction (universal, no hardcoding) ───────────────────────
 
-  const data = await page.evaluate(() => {
-    // ── Price extraction ──────────────────────────────────────────────────
-    function findPrices() {
-      const prices = [];
+async function extractProductData(page) {
+  await page.waitForTimeout(600);
 
-      // 1) JSON-LD structured data (most reliable)
-      const ldScripts = document.querySelectorAll('script[type="application/ld+json"]');
-      for (const s of ldScripts) {
-        try {
-          const json = JSON.parse(s.textContent);
-          const items = Array.isArray(json) ? json : [json];
-          for (const item of items) {
-            const offer = item?.offers || item?.Offers;
-            if (offer) {
-              const offerList = Array.isArray(offer) ? offer : [offer];
-              for (const o of offerList) {
-                if (o.price) {
-                  prices.push({
-                    value: String(o.price),
-                    currency: o.priceCurrency || "BGN",
-                    source: "json-ld",
-                  });
-                }
-              }
-            }
-            if (item?.price) {
-              prices.push({ value: String(item.price), currency: item.priceCurrency || "", source: "json-ld" });
-            }
-          }
-        } catch { /* malformed JSON-LD, skip */ }
-      }
-
-      // 2) Microdata / itemprop="price"
-      const priceEls = document.querySelectorAll('[itemprop="price"]');
-      for (const el of priceEls) {
-        const val = el.getAttribute("content") || el.textContent?.trim();
-        if (val) prices.push({ value: val, currency: "", source: "microdata" });
-      }
-
-      // 3) Meta og:price
-      const ogPrice = document.querySelector('meta[property="og:price:amount"], meta[property="product:price:amount"]');
-      if (ogPrice) {
-        prices.push({ value: ogPrice.getAttribute("content") || "", currency: "", source: "og" });
-      }
-
-      // 4) DOM heuristic — look for common price patterns
-      if (prices.length === 0) {
-        const priceRegex = /(\d[\d\s.,]*\d)\s*(лв\.?|лева|BGN|EUR|€|\$|USD)/i;
-        const altRegex = /(лв\.?|BGN|EUR|€|\$)\s*(\d[\d\s.,]*\d)/i;
-
-        // Common price class/attribute patterns
-        const candidates = document.querySelectorAll(
-          '[class*="price"], [class*="Price"], [class*="cost"], [class*="amount"], ' +
-          '[id*="price"], [id*="Price"], [data-price], ' +
-          '.product-price, .current-price, .sale-price, .regular-price'
-        );
-
-        for (const el of candidates) {
-          const text = el.textContent?.trim() || "";
-          const match = text.match(priceRegex) || text.match(altRegex);
-          if (match) {
-            prices.push({ value: text.slice(0, 60), currency: "", source: "dom" });
-            break; // one is enough
-          }
-        }
-
-        // Last resort: scan all visible text for price patterns
-        if (prices.length === 0) {
-          const body = document.body?.innerText || "";
-          const matches = body.match(/(\d{1,6}[.,]\d{2})\s*(лв\.?|лева|BGN|EUR|€)/g);
-          if (matches && matches.length > 0) {
-            prices.push({ value: matches[0], currency: "", source: "text-scan" });
-          }
-        }
-      }
-
-      return prices;
-    }
-
-    // ── Title extraction ──────────────────────────────────────────────────
-    function findTitle() {
-      // JSON-LD name
-      const ldScripts = document.querySelectorAll('script[type="application/ld+json"]');
-      for (const s of ldScripts) {
-        try {
-          const json = JSON.parse(s.textContent);
-          const items = Array.isArray(json) ? json : [json];
-          for (const item of items) {
-            if (item?.name && (item["@type"] === "Product" || item["@type"] === "IndividualProduct")) {
-              return item.name;
-            }
-          }
-        } catch { /* skip */ }
-      }
-
-      // og:title
-      const og = document.querySelector('meta[property="og:title"]');
-      if (og?.content) return og.content;
-
-      // h1
-      const h1 = document.querySelector("h1");
-      if (h1?.textContent?.trim()) return h1.textContent.trim();
-
-      // document title
-      return document.title || "";
-    }
-
-    // ── Description extraction ────────────────────────────────────────────
-    function findDescription() {
-      const og = document.querySelector('meta[property="og:description"], meta[name="description"]');
-      if (og?.content) return og.content.slice(0, 300);
-
-      const descEl = document.querySelector(
-        '[class*="description"], [class*="Description"], [itemprop="description"]'
-      );
-      if (descEl?.textContent?.trim()) return descEl.textContent.trim().slice(0, 300);
-
-      return "";
-    }
-
-    // ── Availability extraction ───────────────────────────────────────────
-    function findAvailability() {
+  return page.evaluate(() => {
+    // Price
+    function findPrice() {
       // JSON-LD
-      const ldScripts = document.querySelectorAll('script[type="application/ld+json"]');
-      for (const s of ldScripts) {
+      for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
         try {
-          const json = JSON.parse(s.textContent);
-          const items = Array.isArray(json) ? json : [json];
-          for (const item of items) {
-            const offer = item?.offers || item?.Offers;
-            if (offer) {
-              const offerList = Array.isArray(offer) ? offer : [offer];
-              for (const o of offerList) {
-                if (o.availability) {
-                  return o.availability.replace("https://schema.org/", "").replace("http://schema.org/", "");
-                }
-              }
+          const walk = (obj) => {
+            if (!obj || typeof obj !== "object") return null;
+            if (Array.isArray(obj)) { for (const i of obj) { const r = walk(i); if (r) return r; } return null; }
+            const offers = obj.offers || obj.Offers;
+            if (offers) {
+              const list = Array.isArray(offers) ? offers : [offers];
+              for (const o of list) { if (o.price) return `${o.price} ${o.priceCurrency || "лв."}`; }
             }
-          }
-        } catch { /* skip */ }
+            if (obj.price) return `${obj.price} ${obj.priceCurrency || ""}`;
+            for (const v of Object.values(obj)) { const r = walk(v); if (r) return r; }
+            return null;
+          };
+          const r = walk(JSON.parse(s.textContent));
+          if (r) return r;
+        } catch {}
       }
 
-      // DOM text scan
-      const avail = document.querySelector(
-        '[class*="availab"], [class*="stock"], [class*="наличност"], [class*="Наличност"]'
-      );
-      if (avail?.textContent?.trim()) return avail.textContent.trim().slice(0, 100);
+      // itemprop
+      const ip = document.querySelector('[itemprop="price"]');
+      if (ip) return ip.getAttribute("content") || ip.textContent?.trim() || "";
 
-      return "";
+      // og
+      const og = document.querySelector('meta[property="og:price:amount"], meta[property="product:price:amount"]');
+      if (og) return og.getAttribute("content") || "";
+
+      // DOM class scan
+      const priceRe = /(\d[\d\s.,]*\d)\s*(лв\.?|лева|BGN|EUR|€|\$|USD)/i;
+      for (const el of document.querySelectorAll('[class*="price" i], [class*="Price"], [data-price]')) {
+        const m = el.textContent?.trim()?.match(priceRe);
+        if (m) return m[0];
+      }
+
+      // Full body scan (last resort)
+      const bodyMatch = document.body?.innerText?.match(/(\d{1,6}[.,]\d{2})\s*(лв\.?|лева|BGN|EUR|€)/);
+      return bodyMatch ? bodyMatch[0] : "";
+    }
+
+    // Title
+    function findTitle() {
+      for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try {
+          const j = JSON.parse(s.textContent);
+          const items = Array.isArray(j) ? j : [j];
+          for (const i of items) if (i?.name && /product/i.test(i["@type"] || "")) return i.name;
+        } catch {}
+      }
+      return document.querySelector('meta[property="og:title"]')?.content
+        || document.querySelector("h1")?.textContent?.trim()
+        || document.title || "";
+    }
+
+    // Availability
+    function findAvailability() {
+      for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try {
+          const j = JSON.parse(s.textContent);
+          const items = Array.isArray(j) ? j : [j];
+          for (const i of items) {
+            const offers = i?.offers || i?.Offers;
+            if (offers) {
+              const list = Array.isArray(offers) ? offers : [offers];
+              for (const o of list) if (o.availability) return o.availability.replace(/https?:\/\/schema\.org\//g, "");
+            }
+          }
+        } catch {}
+      }
+      const el = document.querySelector('[class*="stock" i], [class*="availab" i], [class*="наличност" i]');
+      return el?.textContent?.trim()?.slice(0, 100) || "";
     }
 
     return {
-      title: findTitle()?.slice(0, 250) || "",
-      prices: findPrices().slice(0, 3),
-      description: findDescription(),
+      title: (findTitle() || "").slice(0, 250),
+      price: findPrice() || "",
+      description: (document.querySelector('meta[property="og:description"], meta[name="description"]')?.content || "").slice(0, 300),
       availability: findAvailability(),
-      canonical: document.querySelector('link[rel="canonical"]')?.href || "",
+      url: document.querySelector('link[rel="canonical"]')?.href || location.href,
     };
   });
-
-  return data;
 }
 
-// ── Main entry point ───────────────────────────────────────────────────────────
+// ── Search results page: extract product links ───────────────────────────────
 
-/**
- * Perform a live browser search + extraction.
- *
- * @param {Object}  opts
- * @param {string}  opts.siteUrl   — the business site URL (e.g. "https://praktiker.bg")
- * @param {string}  opts.query     — the user's search query
- * @param {Object}  [opts.logger]  — Fastify-compatible logger (optional)
- * @returns {Promise<{ ok: boolean, results: Array, source: string, elapsed_ms: number }>}
- */
+async function extractSearchResultLinks(page, domain) {
+  return page.evaluate((domain) => {
+    const links = [];
+    const seen = new Set();
+
+    for (const a of document.querySelectorAll("a[href]")) {
+      const href = a.href;
+      if (!href || seen.has(href)) continue;
+
+      let onDomain = false;
+      try { onDomain = new URL(href).hostname.replace(/^www\./, "").includes(domain); } catch { continue; }
+      if (!onDomain) continue;
+
+      const path = new URL(href).pathname;
+      if (path.length < 5) continue;
+      if (/\/(search|login|cart|account|checkout|register|wishlist)/i.test(path)) continue;
+
+      const text = a.textContent?.trim() || "";
+      if (text.length < 3) continue;
+
+      seen.add(href);
+      links.push({ url: href, title: text.slice(0, 200) });
+      if (links.length >= 5) break;
+    }
+
+    return links;
+  }, domain);
+}
+
+// ── Try interacting with the site's search bar ───────────────────────────────
+
+async function trySearchOnSite(page, siteUrl, query, logger) {
+  const origin = getOrigin(siteUrl);
+
+  await page.goto(origin, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  await page.waitForTimeout(500);
+
+  const searchSelectors = [
+    'input[type="search"]',
+    'input[name="q"]',
+    'input[name="search"]',
+    'input[name="keyword"]',
+    'input[name="text"]',
+    'input[name="s"]',
+    'input[placeholder*="търс" i]',
+    'input[placeholder*="search" i]',
+    'input[aria-label*="search" i]',
+    'input[aria-label*="търс" i]',
+    'input[id*="search" i]',
+    'input[class*="search" i]',
+  ];
+
+  for (const sel of searchSelectors) {
+    const input = await page.$(sel);
+    if (!input) continue;
+
+    let visible = await input.isVisible().catch(() => false);
+    if (!visible) {
+      // Click search icon/toggle to reveal it
+      const toggle = await page.$('[class*="search" i] button, [class*="search" i] a, button[aria-label*="search" i], .search-toggle, .search-icon');
+      if (toggle) {
+        await toggle.click().catch(() => {});
+        await page.waitForTimeout(400);
+      }
+      visible = await input.isVisible().catch(() => false);
+      if (!visible) continue;
+    }
+
+    await input.click();
+    await input.fill(query);
+    await page.waitForTimeout(200);
+    await input.press("Enter");
+    await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => {});
+    await page.waitForTimeout(800);
+
+    logger.info?.({ method: "search_input", selector: sel }, "[browser-search] submitted search on site");
+    return true;
+  }
+
+  return false;
+}
+
+// ── Try common search URL patterns ───────────────────────────────────────────
+
+async function trySearchUrls(page, siteUrl, query, logger) {
+  const origin = getOrigin(siteUrl);
+  const urls = buildSearchUrls(origin, query);
+
+  for (const url of urls) {
+    try {
+      const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+      if (!resp || resp.status() >= 400) continue;
+
+      await page.waitForTimeout(500);
+      const hasContent = await page.evaluate(() => document.querySelectorAll("a[href]").length > 10);
+      if (hasContent) {
+        logger.info?.({ method: "url_pattern", url }, "[browser-search] found results via URL pattern");
+        return true;
+      }
+    } catch { continue; }
+  }
+
+  return false;
+}
+
+// ── Main entry ────────────────────────────────────────────────────────────────
+
 export async function browserSearch({ siteUrl, query, logger = console }) {
   const started = Date.now();
   const elapsed = () => Date.now() - started;
 
-  // Global abort — never exceed BROWSER_TIMEOUT_MS
-  const abortController = new AbortController();
-  const globalTimer = setTimeout(() => abortController.abort(), BROWSER_TIMEOUT_MS);
-
   let context = null;
 
   try {
-    // Extract domain for filtering
-    let targetDomain = "";
-    try {
-      targetDomain = new URL(siteUrl).hostname.replace(/^www\./, "");
-    } catch {
-      targetDomain = siteUrl.replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0];
-    }
-
-    const searchQuery = buildSearchQuery(siteUrl, query);
-    logger.info?.({ searchQuery, targetDomain }, "[browser-search] starting fallback search");
+    const domain = getDomain(siteUrl);
+    logger.info?.({ query, domain }, "[browser-search] starting direct site search");
 
     const browser = await getBrowser();
     context = await browser.newContext({
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
       locale: "bg-BG",
       timezoneId: "Europe/Sofia",
       viewport: { width: 1280, height: 720 },
-      javaScriptEnabled: true,
     });
 
-    // Block heavy resources for speed
-    await context.route("**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,eot,mp4,mp3,avi}", (route) =>
-      route.abort()
-    );
-    await context.route("**/{analytics,tracking,ads,facebook,google-analytics,gtag,doubleclick}**", (route) =>
-      route.abort()
-    );
+    // Block images/fonts/analytics for speed
+    await context.route("**/*.{png,jpg,jpeg,gif,webp,woff,woff2,ttf,eot,mp4,avi}", (r) => r.abort());
+    await context.route("**/{analytics,tracking,facebook,google-analytics,gtag,doubleclick,hotjar}**", (r) => r.abort());
 
     const page = await context.newPage();
+    page.setDefaultTimeout(NAV_TIMEOUT_MS);
 
-    // ── Step 1: Google search ──────────────────────────────────────────
-    if (abortController.signal.aborted) throw new Error("timeout");
+    // ── Step 1: Search on the site ────────────────────────────────────
+    let foundResults = await trySearchOnSite(page, siteUrl, query, logger);
 
-    const serpResults = await searchGoogle(page, searchQuery, targetDomain);
-    logger.info?.({ count: serpResults.length, elapsed: elapsed() }, "[browser-search] SERP results collected");
-
-    if (serpResults.length === 0) {
-      return {
-        ok: false,
-        results: [],
-        source: "browser_fallback",
-        elapsed_ms: elapsed(),
-        reason: "no_serp_results",
-      };
+    if (!foundResults) {
+      logger.info?.("[browser-search] no search input found, trying URL patterns");
+      foundResults = await trySearchUrls(page, siteUrl, query, logger);
     }
 
-    // ── Step 2: Visit top results and extract product data ─────────────
-    const extractedResults = [];
+    if (!foundResults) {
+      logger.warn?.("[browser-search] could not search on site at all");
+      return { ok: false, results: [], source: "browser_fallback", elapsed_ms: elapsed(), reason: "no_search_method" };
+    }
 
-    for (const serp of serpResults) {
-      if (abortController.signal.aborted) break;
-      if (elapsed() > BROWSER_TIMEOUT_MS - 1000) break; // leave 1s margin
+    // ── Step 2: Extract product links from search results ─────────────
+    const productLinks = await extractSearchResultLinks(page, domain);
+    logger.info?.({ count: productLinks.length, elapsed: elapsed() }, "[browser-search] product links found");
+
+    if (productLinks.length === 0) {
+      // Maybe we landed directly on a product page?
+      const directData = await extractProductData(page);
+      if (directData.price) {
+        return {
+          ok: true,
+          results: [{
+            title: directData.title, price: directData.price, url: directData.url,
+            snippet: directData.description, availability: directData.availability,
+            on_domain: true, source: "browser_fallback",
+          }],
+          source: "browser_fallback",
+          elapsed_ms: elapsed(),
+        };
+      }
+      return { ok: false, results: [], source: "browser_fallback", elapsed_ms: elapsed(), reason: "no_product_links" };
+    }
+
+    // ── Step 3: Visit top product pages, extract data ─────────────────
+    const results = [];
+
+    for (const link of productLinks.slice(0, MAX_PRODUCT_VISITS)) {
+      if (elapsed() > BROWSER_TIMEOUT_MS - 1500) break;
 
       try {
-        const raw = await Promise.race([
-          extractProductData(page, serp.url),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("extract_timeout")), EXTRACT_TIMEOUT_MS)
-          ),
-        ]);
+        await page.goto(link.url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+        const data = await extractProductData(page);
 
-        const priceStr = raw.prices?.[0]?.value || "";
-        const title = raw.title || serp.title || "";
+        const title = data.title || link.title || "";
+        const price = data.price || "";
 
-        if (title || priceStr) {
-          extractedResults.push({
-            title: title.slice(0, 250),
-            price: priceStr,
-            url: raw.canonical || serp.url,
-            snippet: raw.description || "",
-            availability: raw.availability || "",
-            on_domain: serp.onDomain ?? false,
-            source: "browser_fallback",
+        if (title || price) {
+          results.push({
+            title: title.slice(0, 250), price,
+            url: data.url || link.url,
+            snippet: data.description || "",
+            availability: data.availability || "",
+            on_domain: true, source: "browser_fallback",
           });
+          logger.info?.({ title: title.slice(0, 60), price, elapsed: elapsed() }, "[browser-search] extracted product");
         }
       } catch (err) {
-        logger.warn?.(
-          { url: serp.url, error: err.message, elapsed: elapsed() },
-          "[browser-search] extraction failed for URL"
-        );
+        logger.warn?.({ url: link.url, error: err.message }, "[browser-search] product extraction failed");
       }
     }
 
-    logger.info?.(
-      { found: extractedResults.length, elapsed: elapsed() },
-      "[browser-search] extraction complete"
-    );
+    logger.info?.({ found: results.length, elapsed: elapsed() }, "[browser-search] done");
 
-    return {
-      ok: extractedResults.length > 0,
-      results: extractedResults,
-      source: "browser_fallback",
-      elapsed_ms: elapsed(),
-    };
+    return { ok: results.length > 0, results, source: "browser_fallback", elapsed_ms: elapsed() };
+
   } catch (err) {
-    const msg = err.message || String(err);
-    if (msg !== "timeout") {
-      logger.error?.({ error: msg, elapsed: elapsed() }, "[browser-search] fallback failed");
-    }
-
-    return {
-      ok: false,
-      results: [],
-      source: "browser_fallback",
-      elapsed_ms: elapsed(),
-      reason: msg === "timeout" ? "global_timeout" : msg,
-    };
+    logger.error?.({ error: err.message, elapsed: elapsed() }, "[browser-search] fallback failed");
+    return { ok: false, results: [], source: "browser_fallback", elapsed_ms: elapsed(), reason: err.message };
   } finally {
-    clearTimeout(globalTimer);
-    if (context) {
-      await context.close().catch(() => {});
-    }
+    if (context) await context.close().catch(() => {});
   }
 }
 
-/**
- * Wrapper with 1 retry.
- */
 export async function browserSearchWithRetry(opts) {
   const first = await browserSearch(opts);
   if (first.ok && first.results.length > 0) return first;
@@ -494,6 +391,5 @@ export async function browserSearchWithRetry(opts) {
   return browserSearch(opts);
 }
 
-// ── Cleanup on process exit ────────────────────────────────────────────────────
 process.on("SIGINT", closeBrowser);
 process.on("SIGTERM", closeBrowser);
