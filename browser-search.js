@@ -181,24 +181,66 @@ async function extractSearchResultLinks(page, domain) {
     const links = [];
     const seen = new Set();
 
-    for (const a of document.querySelectorAll("a[href]")) {
-      const href = a.href;
-      if (!href || seen.has(href)) continue;
+    // Strategy 1: Look for product card links (most reliable)
+    const productCardSelectors = [
+      '.product-card a[href]', '.product-item a[href]', '.product a[href]',
+      '[class*="product" i] a[href]', '[class*="item-card" i] a[href]',
+      '.search-results a[href]', '[class*="search-result" i] a[href]',
+      '[class*="listing" i] a[href]', '.category-products a[href]',
+      '[data-product] a[href]', '[data-item] a[href]',
+    ];
 
-      let onDomain = false;
-      try { onDomain = new URL(href).hostname.replace(/^www\./, "").includes(domain); } catch { continue; }
-      if (!onDomain) continue;
+    for (const sel of productCardSelectors) {
+      for (const a of document.querySelectorAll(sel)) {
+        const href = a.href;
+        if (!href || seen.has(href)) continue;
 
-      const path = new URL(href).pathname;
-      if (path.length < 5) continue;
-      if (/\/(search|login|cart|account|checkout|register|wishlist)/i.test(path)) continue;
+        let onDomain = false;
+        try { onDomain = new URL(href).hostname.replace(/^www\./, "").includes(domain); } catch { continue; }
+        if (!onDomain) continue;
 
-      const text = a.textContent?.trim() || "";
-      if (text.length < 3) continue;
+        const path = new URL(href).pathname;
+        if (path.length < 5) continue;
+        if (/\/(search|login|cart|account|checkout|register|wishlist|category|categories)/i.test(path)) continue;
 
-      seen.add(href);
-      links.push({ url: href, title: text.slice(0, 200) });
+        // Prefer links that look like product pages (have slug-like paths)
+        const segments = path.split("/").filter(Boolean);
+        if (segments.length < 1) continue;
+
+        const text = a.textContent?.trim() || a.getAttribute("title") || "";
+
+        seen.add(href);
+        links.push({ url: href, title: text.slice(0, 200) });
+        if (links.length >= 5) break;
+      }
       if (links.length >= 5) break;
+    }
+
+    // Strategy 2: Fallback — any link that looks like a product URL
+    if (links.length === 0) {
+      for (const a of document.querySelectorAll("a[href]")) {
+        const href = a.href;
+        if (!href || seen.has(href)) continue;
+
+        let onDomain = false;
+        try { onDomain = new URL(href).hostname.replace(/^www\./, "").includes(domain); } catch { continue; }
+        if (!onDomain) continue;
+
+        const path = new URL(href).pathname;
+        if (path.length < 10) continue;
+        if (/\/(search|login|cart|account|checkout|register|wishlist|category|categories|about|contact|faq|help|blog)/i.test(path)) continue;
+
+        // Must have slug-like path (e.g. /product-name-123)
+        const lastSeg = path.split("/").filter(Boolean).pop() || "";
+        if (lastSeg.length < 5 || !/[a-z]/i.test(lastSeg)) continue;
+
+        const text = a.textContent?.trim() || "";
+        if (text.length < 3) continue;
+
+        seen.add(href);
+        links.push({ url: href, title: text.slice(0, 200) });
+        if (links.length >= 5) break;
+      }
     }
 
     return links;
@@ -362,7 +404,62 @@ export async function browserSearch({ siteUrl, query, logger = console }) {
       return { ok: false, results: [], source: "browser_fallback", elapsed_ms: elapsed(), reason: "no_search_method" };
     }
 
-    // ── Step 2: Extract product links from search results ─────────────
+    // ── Step 2: Try extracting products with prices directly from search results page ──
+    //    (Many sites show prices in search results — no need to visit individual pages)
+    const searchPageProducts = await page.evaluate((domain) => {
+      const products = [];
+      const priceRe = /(\d[\d\s.,]*\d)\s*(лв\.?|лева|BGN|EUR|€|\$|USD)/i;
+      
+      // Look for product cards that contain both a link and a price
+      const cardSelectors = [
+        '.product-card', '.product-item', '.product', '[class*="product" i]',
+        '[data-product]', '[data-item]', '.search-result-item', '[class*="item-card" i]',
+        '.category-products > div', '.category-products > li',
+        '[class*="listing" i] > div', '[class*="listing" i] > li',
+      ];
+      
+      for (const sel of cardSelectors) {
+        for (const card of document.querySelectorAll(sel)) {
+          const link = card.querySelector('a[href]');
+          if (!link) continue;
+          
+          const href = link.href;
+          try { 
+            if (!new URL(href).hostname.replace(/^www\./, "").includes(domain)) continue; 
+          } catch { continue; }
+          
+          const cardText = card.textContent || "";
+          const priceMatch = cardText.match(priceRe);
+          if (!priceMatch) continue;
+          
+          const title = link.getAttribute("title") || link.textContent?.trim() || 
+                        card.querySelector("h2, h3, h4, [class*='name' i], [class*='title' i]")?.textContent?.trim() || "";
+          if (!title || title.length < 3) continue;
+          
+          products.push({
+            title: title.slice(0, 250),
+            price: priceMatch[0],
+            url: href,
+            snippet: "",
+            availability: "",
+            on_domain: true,
+            source: "browser_fallback",
+          });
+          
+          if (products.length >= 5) break;
+        }
+        if (products.length >= 5) break;
+      }
+      
+      return products;
+    }, getDomain(siteUrl));
+    
+    if (searchPageProducts.length > 0) {
+      logger.info?.({ found: searchPageProducts.length, elapsed: elapsed() }, "[browser-search] extracted products from search results page");
+      return { ok: true, results: searchPageProducts, source: "browser_fallback", elapsed_ms: elapsed() };
+    }
+
+    // ── Step 3: Extract product links from search results ─────────────
     const productLinks = await extractSearchResultLinks(page, domain);
     logger.info?.({ count: productLinks.length, elapsed: elapsed() }, "[browser-search] product links found");
 
@@ -384,14 +481,15 @@ export async function browserSearch({ siteUrl, query, logger = console }) {
       return { ok: false, results: [], source: "browser_fallback", elapsed_ms: elapsed(), reason: "no_product_links" };
     }
 
-    // ── Step 3: Visit top product pages, extract data ─────────────────
+    // ── Step 4: Visit top product pages, extract data ─────────────────
     const results = [];
 
     for (const link of productLinks.slice(0, MAX_PRODUCT_VISITS)) {
-      if (elapsed() > BROWSER_TIMEOUT_MS - 1500) break;
+      if (elapsed() > BROWSER_TIMEOUT_MS - 2000) break;
 
       try {
-        await page.goto(link.url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+        await page.goto(link.url, { waitUntil: "networkidle", timeout: NAV_TIMEOUT_MS });
+        await page.waitForTimeout(300);
         const data = await extractProductData(page);
 
         const title = data.title || link.title || "";
@@ -425,8 +523,16 @@ export async function browserSearch({ siteUrl, query, logger = console }) {
 }
 
 export async function browserSearchWithRetry(opts) {
+  const globalStart = Date.now();
   const first = await browserSearch(opts);
   if (first.ok && first.results.length > 0) return first;
+
+  // Don't retry if we already used more than half the timeout budget
+  const elapsedSoFar = Date.now() - globalStart;
+  if (elapsedSoFar > (BROWSER_TIMEOUT_MS / 2)) {
+    opts.logger?.info?.({ elapsed: elapsedSoFar }, "[browser-search] skipping retry — not enough time left");
+    return first;
+  }
 
   opts.logger?.info?.("[browser-search] retrying once…");
   return browserSearch(opts);
