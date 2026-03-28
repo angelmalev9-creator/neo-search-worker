@@ -7,6 +7,10 @@ services:
     restart: unless-stopped
     ports:
       - "3210:3210"
+    # Chromium needs larger shared memory
+    shm_size: "256mb"
+    security_opt:
+      - seccomp=unconfined
     environment:
       PORT: "3210"
       WORKER_SECRET: "${WORKER_SECRET}"
