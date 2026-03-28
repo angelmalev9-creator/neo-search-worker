@@ -4,8 +4,8 @@ import { browserSearchWithRetry, closeBrowser } from "./browser-search.js";
 
 const app = Fastify({ logger: true, bodyLimit: 1024 * 1024 });
 
+// -- Auth Middleware --
 const WORKER_SECRET = process.env.WORKER_SECRET;
-
 app.addHook("preHandler", async (req, reply) => {
   if (req.url === "/health") return;
   const auth = req.headers["authorization"] ?? "";
@@ -14,64 +14,77 @@ app.addHook("preHandler", async (req, reply) => {
   }
 });
 
-// Helper to determine if we need live fallback
-function needsFallback(dbResponse, query) {
-  if (!dbResponse.results || dbResponse.results.length === 0) return "empty_results";
-  if (dbResponse.confidence < 0.6) return "low_confidence";
-  
-  const isProductQuery = /цена|цени|цена|lv|лв/i.test(query);
-  const hasPrice = dbResponse.results.some(r => r.price || (r.structured_data && r.structured_data.price));
-  if (isProductQuery && !hasPrice) return "missing_pricing";
-  
-  return null;
-}
+// -- Supabase Client --
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// -- Helper: Detect Product Intent --
+const isProductIntent = (query) => {
+  const keywords = ["цена", "цени", "lv", "лв", "колко", "price", "buy", "купи"];
+  return keywords.some(k => query.toLowerCase().includes(k));
+};
 
 app.post("/search", async (req, reply) => {
   const { session_id, query, site_url } = req.body;
   const startedAt = Date.now();
 
   try {
-    // 1. Perform existing Supabase structured search
-    // (Assuming logic from existing search worker)
-    const dbResponse = await performStructuredSearch(session_id, query); 
+    // 1. Perform Original Structured Search (e.g., Supabase query)
+    // Replace this with your specific DB search logic if it differs
+    const { data: dbData } = await supabase
+      .from("structured_data")
+      .select("*")
+      .textSearch("summary", query)
+      .limit(3);
 
-    // 2. Evaluate fallback trigger
-    const fallbackReason = needsFallback(dbResponse, query);
+    let response = {
+      results: dbData || [],
+      confidence: dbData?.length > 0 ? 0.8 : 0,
+      query
+    };
 
-    if (fallbackReason && site_url) {
-      req.log.info({ fallbackReason, query }, "[fallback] triggering live browser search");
-      
-      const liveResults = await browserSearchWithRetry({
+    // 2. CHECK FALLBACK CONDITIONS
+    const hasNoResults = response.results.length === 0;
+    const isLowConfidence = response.confidence < 0.6;
+    const isMissingPrice = isProductIntent(query) && !response.results.some(r => r.price);
+
+    if ((hasNoResults || isLowConfidence || isMissingPrice) && site_url) {
+      req.log.info({ query, reason: hasNoResults ? "none" : isMissingPrice ? "no_price" : "low_conf" }, "[fallback] Triggering Playwright");
+
+      const liveData = await browserSearchWithRetry({
         siteUrl: site_url,
         query: query,
         logger: req.log
       });
 
-      if (liveResults.ok && liveResults.results.length > 0) {
+      if (liveData.ok && liveData.results.length > 0) {
         return reply.send({
-          ...dbResponse,
-          results: [...liveResults.results, ...dbResponse.results].slice(0, 5),
+          results: [...liveData.results, ...response.results],
+          confidence: 0.95,
           fallback_triggered: true,
-          fallback_reason: fallbackReason,
-          confidence: 0.9,
           elapsed_ms: Date.now() - startedAt
         });
       }
     }
 
     return reply.send({
-      ...dbResponse,
+      ...response,
       fallback_triggered: false,
       elapsed_ms: Date.now() - startedAt
     });
 
   } catch (err) {
     req.log.error(err);
-    return reply.code(500).send({ error: "Search execution failed" });
+    return reply.code(500).send({ error: "Search failed", details: err.message });
   }
 });
 
-app.listen({ port: 3210, host: "0.0.0.0" });
+app.get("/health", async () => ({ status: "ok" }));
+
+const port = process.env.PORT || 3210;
+app.listen({ port, host: "0.0.0.0" });
 
 process.on("SIGTERM", async () => {
   await closeBrowser();
