@@ -2,23 +2,17 @@ version: "3.9"
 
 services:
   neo-search-worker:
+    build: .
     image: neo-search-worker:latest
     container_name: neo-search-worker
     restart: unless-stopped
     ports:
       - "3210:3210"
-    # Chromium needs larger shared memory
-    shm_size: "256mb"
-    security_opt:
-      - seccomp=unconfined
+    shm_size: "512mb" # Увеличено за по-стабилен браузър
     environment:
-      PORT: "3210"
-      WORKER_SECRET: "${WORKER_SECRET}"
-      SUPABASE_URL: "${SUPABASE_URL}"
-      SUPABASE_SERVICE_ROLE_KEY: "${SUPABASE_SERVICE_ROLE_KEY}"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3210/health >/dev/null 2>&1 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
+      - PORT=3210
+      - WORKER_SECRET=${WORKER_SECRET}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - BROWSER_TIMEOUT_MS=20000
+    # НЕ добавяй volumes: - .:/app тук!
