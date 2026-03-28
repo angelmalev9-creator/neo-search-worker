@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import { createClient } from "@supabase/supabase-js";
+import { browserSearchWithRetry, closeBrowser } from "./browser-search.js";
 
 const app = Fastify({
   logger: true,
@@ -478,6 +479,92 @@ app.get("/health", async () => ({
   service: "neo-search-worker",
 }));
 
+// ── Fallback trigger logic ────────────────────────────────────────────────────
+
+const PRICE_KEYWORDS = [
+  "цена", "цени", "price", "prices", "лв", "bgn", "eur", "стойност",
+  "колко струва", "how much", "cost",
+];
+
+/**
+ * Determine whether the structured search response warrants a live browser
+ * fallback. Returns a reason string or null (no fallback needed).
+ */
+function needsFallback(response, intent) {
+  // 1) No results at all
+  if (!response.results || response.results.length === 0) {
+    return "no_results";
+  }
+
+  // 2) Low confidence
+  if (response.confidence < 0.6) {
+    return "low_confidence";
+  }
+
+  // 3) User wants pricing but none was found in the top results
+  if (intent.productish) {
+    const wantsPrice = PRICE_KEYWORDS.some((k) => intent.normalized.includes(k));
+    if (wantsPrice) {
+      const topExcerpts = response.results
+        .slice(0, 3)
+        .map((r) => (r.excerpts || []).join(" "))
+        .join(" ")
+        .toLowerCase();
+
+      const hasPriceData = /\d+([.,]\d{2})?\s*(лв|bgn|eur|€|\$|usd)/i.test(topExcerpts);
+      if (!hasPriceData) {
+        return "product_no_price";
+      }
+    }
+  }
+
+  return null; // no fallback needed
+}
+
+/**
+ * Merge browser fallback results into the existing response format.
+ */
+function mergeFallbackResults(originalResponse, fallbackData, startedAt) {
+  if (!fallbackData.ok || !fallbackData.results?.length) {
+    return originalResponse; // keep original if fallback also failed
+  }
+
+  const fallbackResults = fallbackData.results.map((r) => ({
+    title: r.title || "",
+    url: r.url || "",
+    page_type: "product",
+    score: 100, // synthetic score — browser results are high-relevance
+    matched: [],
+    excerpts: [r.snippet, r.price, r.availability].filter(Boolean),
+    source: "browser_fallback",
+    kind: "productish",
+    price: r.price || "",
+    availability: r.availability || "",
+  }));
+
+  // Append fallback results after existing ones (don't replace)
+  const mergedResults = [...(originalResponse.results || []), ...fallbackResults];
+
+  // Re-sort: browser results with price data bubble up when price was sought
+  mergedResults.sort((a, b) => {
+    // Price-bearing results first
+    if (a.price && !b.price) return -1;
+    if (!a.price && b.price) return 1;
+    return b.score - a.score;
+  });
+
+  return {
+    ...originalResponse,
+    results: mergedResults.slice(0, 10),
+    confidence: Math.max(originalResponse.confidence, fallbackData.results.length > 0 ? 0.75 : 0),
+    needs_clarification: false,
+    fallback_used: true,
+    fallback_source: "browser",
+    fallback_elapsed_ms: fallbackData.elapsed_ms,
+    elapsed_ms: Date.now() - startedAt,
+  };
+}
+
 app.post("/search", async (req, reply) => {
   const startedAt = Date.now();
 
@@ -503,13 +590,54 @@ app.post("/search", async (req, reply) => {
       });
     }
 
+    const resolvedSiteUrl = site_url || session.site_url || "";
     const intent = buildIntent(query);
     const docs = toSearchDocuments({
       ...session,
-      site_url: site_url || session.site_url || "",
+      site_url: resolvedSiteUrl,
     });
 
     if (!docs.length) {
+      // ── No structured data at all → try browser fallback directly ────
+      if (resolvedSiteUrl) {
+        req.log.info({ query, site_url: resolvedSiteUrl }, "[fallback] no docs, trying browser search");
+
+        try {
+          const fallbackData = await browserSearchWithRetry({
+            siteUrl: resolvedSiteUrl,
+            query,
+            logger: req.log,
+          });
+
+          if (fallbackData.ok && fallbackData.results.length > 0) {
+            return reply.send({
+              ok: true,
+              results: fallbackData.results.map((r) => ({
+                title: r.title,
+                url: r.url,
+                page_type: "product",
+                score: 100,
+                matched: [],
+                excerpts: [r.snippet, r.price, r.availability].filter(Boolean),
+                source: "browser_fallback",
+                kind: "productish",
+                price: r.price || "",
+                availability: r.availability || "",
+              })),
+              confidence: 0.7,
+              needs_clarification: false,
+              intent,
+              fallback_used: true,
+              fallback_source: "browser",
+              fallback_elapsed_ms: fallbackData.elapsed_ms,
+              elapsed_ms: Date.now() - startedAt,
+            });
+          }
+        } catch (fbErr) {
+          req.log.warn({ error: fbErr.message }, "[fallback] browser search failed on empty docs");
+        }
+      }
+
       return reply.send({
         ok: true,
         results: [],
@@ -523,6 +651,34 @@ app.post("/search", async (req, reply) => {
 
     const ranked = rankDocuments(docs, intent);
     const response = buildSearchResponse(ranked, intent, startedAt);
+
+    // ── Fallback check ─────────────────────────────────────────────────
+    const fallbackReason = needsFallback(response, intent);
+
+    if (fallbackReason && resolvedSiteUrl) {
+      req.log.info(
+        { reason: fallbackReason, query, confidence: response.confidence, site_url: resolvedSiteUrl },
+        "[fallback] triggering browser search"
+      );
+
+      try {
+        const fallbackData = await browserSearchWithRetry({
+          siteUrl: resolvedSiteUrl,
+          query,
+          logger: req.log,
+        });
+
+        const merged = mergeFallbackResults(response, fallbackData, startedAt);
+        merged.fallback_reason = fallbackReason;
+        return reply.send(merged);
+      } catch (fbErr) {
+        req.log.warn(
+          { error: fbErr.message, reason: fallbackReason },
+          "[fallback] browser search error, returning original results"
+        );
+        // Fall through — return original response
+      }
+    }
 
     return reply.send(response);
   } catch (err) {
@@ -540,3 +696,14 @@ const port = Number(process.env.PORT || 3210);
 app.listen({ port, host: "0.0.0.0" }).then(() => {
   app.log.info(`neo-search-worker listening on :${port}`);
 });
+
+// Graceful shutdown — close shared browser
+async function shutdown(signal) {
+  app.log.info(`${signal} received, closing browser and server…`);
+  await closeBrowser();
+  await app.close();
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
