@@ -1,8 +1,8 @@
 import { chromium } from "playwright";
 
 const BROWSER_TIMEOUT_MS = Number(process.env.BROWSER_TIMEOUT_MS || 25000);
-const PAGE_TIMEOUT_MS = Number(process.env.PAGE_TIMEOUT_MS || 12000);
-const MAX_RESULT_LINKS = Number(process.env.MAX_RESULT_LINKS || 5);
+const PAGE_TIMEOUT_MS = Number(process.env.PAGE_TIMEOUT_MS || 15000);
+const MAX_RESULT_LINKS = Number(process.env.MAX_RESULT_LINKS || 8);
 const MAX_PRODUCT_VISITS = Number(process.env.MAX_PRODUCT_VISITS || 3);
 const IDLE_BROWSER_MS = Number(process.env.IDLE_BROWSER_MS || 10 * 60 * 1000);
 
@@ -33,14 +33,15 @@ function unique(arr) {
 function maxLinksSafe(value) {
   const n = Number(value || 0);
   if (!Number.isFinite(n) || n <= 0) return 5;
-  return Math.min(n, 10);
+  return Math.min(n, 12);
 }
 
 function extractPriceMatches(text) {
   const source = normalizeWhitespace(text);
   if (!source) return [];
 
-  const regex = /\b\d{1,5}(?:[.,]\d{1,2})?\s?(?:лв\.?|lv|eur|€)\b/gi;
+  const regex =
+    /\b\d{1,6}(?:[.,]\d{1,2})?\s?(?:лв\.?|lv|eur|€)\b/gi;
 
   const matches = [];
   let match;
@@ -57,15 +58,20 @@ function buildSearchQueries(domain, query) {
   return unique([
     `site:${domain} ${query}`,
     `${domain} ${query}`,
-  ]);
+    `site:${domain} ${query.replace(/\bцена\b/gi, "").trim()}`,
+  ].filter(Boolean));
 }
 
 function buildSearchUrl(engine, searchQuery) {
   if (engine === "google") {
-    return `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&hl=bg&num=10`;
+    return `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&hl=bg&num=10&gbv=1`;
   }
 
-  return `https://www.bing.com/search?q=${encodeURIComponent(searchQuery)}&setlang=bg-BG`;
+  if (engine === "bing") {
+    return `https://www.bing.com/search?q=${encodeURIComponent(searchQuery)}&setlang=bg-BG`;
+  }
+
+  return `https://html.duckduckgo.com/html/?q=${encodeURIComponent(searchQuery)}`;
 }
 
 function resetIdleTimer() {
@@ -117,14 +123,73 @@ async function getContext() {
   return contextPromise;
 }
 
-async function extractEngineLinks(page, domain) {
-  return page.evaluate(
-    ({ expectedDomain, maxLinks }) => {
-      const normalizeHost = (host) => String(host || "").replace(/^www\./i, "");
+function normalizeResultUrl(rawHref, engine) {
+  if (!rawHref) return "";
 
-      const isSameDomain = (href) => {
+  try {
+    if (rawHref.startsWith("/url?")) {
+      const url = new URL(`https://www.google.com${rawHref}`);
+      return url.searchParams.get("q") || "";
+    }
+
+    const parsed = new URL(rawHref);
+
+    if (engine === "google") {
+      const q = parsed.searchParams.get("q");
+      if (parsed.pathname === "/url" && q) return q;
+    }
+
+    if (engine === "duckduckgo") {
+      const uddg = parsed.searchParams.get("uddg");
+      if (uddg) return decodeURIComponent(uddg);
+    }
+
+    return parsed.href;
+  } catch {
+    return rawHref;
+  }
+}
+
+function sameDomain(targetUrl, domain) {
+  try {
+    const host = new URL(targetUrl).hostname.replace(/^www\./i, "");
+    return host === domain || host.endsWith(`.${domain}`);
+  } catch {
+    return false;
+  }
+}
+
+async function acceptConsentIfPresent(page) {
+  const buttons = [
+    'button:has-text("Приемам")',
+    'button:has-text("Accept")',
+    'button:has-text("I agree")',
+    'button:has-text("Съгласен")',
+    'button:has-text("Разбирам")',
+    '#L2AGLb',
+    'button[aria-label*="Accept"]',
+  ];
+
+  for (const selector of buttons) {
+    try {
+      const el = page.locator(selector).first();
+      if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
+        await el.click({ timeout: 1000 }).catch(() => {});
+        return;
+      }
+    } catch {}
+  }
+}
+
+async function extractEngineLinks(page, domain, engine) {
+  const candidates = await page.evaluate(
+    ({ expectedDomain, currentEngine, maxLinks }) => {
+      const normalizeHost = (host) =>
+        String(host || "").replace(/^www\./i, "");
+
+      const sameDomain = (href) => {
         try {
-          const url = new URL(href);
+          const url = new URL(href, location.href);
           const host = normalizeHost(url.hostname);
           return host === expectedDomain || host.endsWith(`.${expectedDomain}`);
         } catch {
@@ -132,33 +197,141 @@ async function extractEngineLinks(page, domain) {
         }
       };
 
-      const badPatterns = [
-        "/search?",
-        "/preferences?",
-        "/policies?",
-        "/advanced_search",
-        "/imgres?",
-        "/url?",
-        "google.com",
-        "bing.com",
-        "webcache",
-        "/translate",
-      ];
+      const normalizeHref = (href) => {
+        try {
+          if (!href) return "";
 
-      const links = [];
+          if (href.startsWith("/url?")) {
+            const url = new URL(`https://www.google.com${href}`);
+            return url.searchParams.get("q") || "";
+          }
 
-      for (const a of Array.from(document.querySelectorAll("a[href]"))) {
-        const href = a.href || "";
-        if (!href.startsWith("http")) continue;
-        if (!isSameDomain(href)) continue;
-        if (badPatterns.some((part) => href.includes(part))) continue;
-        links.push(href);
+          const parsed = new URL(href, location.href);
+
+          if (currentEngine === "google") {
+            const q = parsed.searchParams.get("q");
+            if (parsed.pathname === "/url" && q) return q;
+          }
+
+          if (currentEngine === "duckduckgo") {
+            const uddg = parsed.searchParams.get("uddg");
+            if (uddg) return decodeURIComponent(uddg);
+          }
+
+          return parsed.href;
+        } catch {
+          return href || "";
+        }
+      };
+
+      const selectorsByEngine = {
+        google: [
+          "a h3",
+          "div.yuRUbf a",
+          "#search a[href]",
+          "a[href]"
+        ],
+        bing: [
+          "li.b_algo h2 a",
+          "#b_results h2 a",
+          "#b_results a[href]",
+          "a[href]"
+        ],
+        duckduckgo: [
+          "a.result__a",
+          ".result a[href]",
+          "a[href]"
+        ],
+      };
+
+      const selectors = selectorsByEngine[currentEngine] || ["a[href]"];
+      const found = [];
+
+      for (const selector of selectors) {
+        const nodes = Array.from(document.querySelectorAll(selector));
+
+        for (const node of nodes) {
+          const anchor = node.closest ? node.closest("a[href]") : node;
+          const href = anchor?.getAttribute?.("href") || anchor?.href || "";
+          const normalized = normalizeHref(href);
+
+          if (!normalized) continue;
+          if (!normalized.startsWith("http")) continue;
+          if (!sameDomain(normalized)) continue;
+
+          found.push(normalized);
+          if (found.length >= maxLinks) break;
+        }
+
+        if (found.length >= maxLinks) break;
       }
 
-      return [...new Set(links)].slice(0, maxLinks);
+      return [...new Set(found)].slice(0, maxLinks);
     },
-    { expectedDomain: domain, maxLinks: maxLinksSafe(MAX_RESULT_LINKS) }
+    {
+      expectedDomain: domain,
+      currentEngine: engine,
+      maxLinks: maxLinksSafe(MAX_RESULT_LINKS),
+    }
   );
+
+  return unique(
+    candidates
+      .map((href) => normalizeResultUrl(href, engine))
+      .filter((href) => href && href.startsWith("http"))
+      .filter((href) => sameDomain(href, domain))
+  ).slice(0, maxLinksSafe(MAX_RESULT_LINKS));
+}
+
+async function clickFirstVisibleResult(page, domain, engine, logger) {
+  const selectorsByEngine = {
+    google: [
+      "div.yuRUbf a",
+      "a:has(h3)",
+      "#search a[href]"
+    ],
+    bing: [
+      "li.b_algo h2 a",
+      "#b_results h2 a",
+      "#b_results a[href]"
+    ],
+    duckduckgo: [
+      "a.result__a",
+      ".result a[href]"
+    ],
+  };
+
+  const selectors = selectorsByEngine[engine] || ["a[href]"];
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector);
+    const count = await locator.count().catch(() => 0);
+
+    for (let i = 0; i < Math.min(count, 10); i++) {
+      try {
+        const link = locator.nth(i);
+        const href = await link.getAttribute("href").catch(() => "");
+        const normalized = normalizeResultUrl(href || "", engine);
+
+        if (!normalized) continue;
+        if (!sameDomain(normalized, domain)) continue;
+
+        logger?.info?.(
+          { engine, selector, target: normalized },
+          "[browser-search] click first visible result"
+        );
+
+        await page.goto(normalized, {
+          waitUntil: "domcontentloaded",
+          timeout: PAGE_TIMEOUT_MS,
+        });
+
+        return normalized;
+      } catch {}
+    }
+  }
+
+  return null;
 }
 
 async function inspectResultPage(context, url, logger) {
@@ -236,7 +409,16 @@ async function runEngineSearch({ context, engine, domain, searchQuery, logger })
       timeout: BROWSER_TIMEOUT_MS,
     });
 
-    const links = await extractEngineLinks(page, domain);
+    await acceptConsentIfPresent(page);
+
+    let links = await extractEngineLinks(page, domain, engine);
+
+    if (!links.length) {
+      const clickedUrl = await clickFirstVisibleResult(page, domain, engine, logger);
+      if (clickedUrl) {
+        links = [clickedUrl];
+      }
+    }
 
     if (!links.length) {
       return {
@@ -301,7 +483,7 @@ export async function browserSearch({ siteUrl, query, logger }) {
 
   const context = await getContext();
   const queries = buildSearchQueries(domain, query);
-  const engines = ["google", "bing"];
+  const engines = ["google", "bing", "duckduckgo"];
 
   const engineSequence = [];
   const failures = [];
