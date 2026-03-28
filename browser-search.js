@@ -1,179 +1,132 @@
 import { chromium } from "playwright";
 
+// ── Config ────────────────────────────────────────────────────────────
 const BROWSER_TIMEOUT_MS = Number(process.env.BROWSER_TIMEOUT_MS || 25000);
-const PAGE_TIMEOUT_MS = Number(process.env.PAGE_TIMEOUT_MS || 15000);
-const MAX_RESULT_LINKS = Number(process.env.MAX_RESULT_LINKS || 8);
+const PAGE_TIMEOUT_MS    = Number(process.env.PAGE_TIMEOUT_MS    || 15000);
 const MAX_PRODUCT_VISITS = Number(process.env.MAX_PRODUCT_VISITS || 3);
-const IDLE_BROWSER_MS = Number(process.env.IDLE_BROWSER_MS || 10 * 60 * 1000);
+const IDLE_BROWSER_MS    = Number(process.env.IDLE_BROWSER_MS    || 10 * 60 * 1000);
 
+// ── Browser singleton ─────────────────────────────────────────────────
 let browserPromise = null;
 let contextPromise = null;
-let idleTimer = null;
+let idleTimer      = null;
+
+// ── Helpers ───────────────────────────────────────────────────────────
 
 function safeDomain(siteUrl) {
-  try {
-    return new URL(siteUrl).hostname.replace(/^www\./i, "");
-  } catch {
-    return "";
-  }
+  try { return new URL(siteUrl).hostname.replace(/^www\./i, ""); }
+  catch { return ""; }
 }
 
-function normalizeWhitespace(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
-}
+function norm(v) { return String(v || "").replace(/\s+/g, " ").trim(); }
 
-function buildExcerpt(text) {
-  return normalizeWhitespace(text).slice(0, 1200);
-}
+function buildExcerpt(text, max = 1500) { return norm(text).slice(0, max); }
 
 function unique(arr) {
   return [...new Set((Array.isArray(arr) ? arr : []).filter(Boolean))];
 }
 
-function maxLinksSafe(value) {
-  const n = Number(value || 0);
-  if (!Number.isFinite(n) || n <= 0) return 5;
-  return Math.min(n, 12);
-}
-
 function extractPriceMatches(text) {
-  const source = normalizeWhitespace(text);
-  if (!source) return [];
-
-  const regex =
-    /\b\d{1,6}(?:[.,]\d{1,2})?\s?(?:лв\.?|lv|eur|€)\b/gi;
-
-  const matches = [];
-  let match;
-
-  while ((match = regex.exec(source)) !== null) {
-    matches.push(match[0]);
-    if (matches.length >= 10) break;
+  const src = norm(text);
+  if (!src) return [];
+  const re = /\b\d{1,6}(?:[.,]\d{1,2})?\s?(?:лв\.?|lv|eur|€|USD|\$|TL|₺)\b/gi;
+  const out = [];
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    out.push(m[0]);
+    if (out.length >= 10) break;
   }
-
-  return unique(matches);
+  return unique(out);
 }
 
-function buildSearchQueries(domain, query) {
-  return unique([
-    `site:${domain} ${query}`,
-    `${domain} ${query}`,
-    `site:${domain} ${query.replace(/\bцена\b/gi, "").trim()}`,
-  ].filter(Boolean));
+function sameDomain(url, domain) {
+  try {
+    const h = new URL(url).hostname.replace(/^www\./i, "");
+    return h === domain || h.endsWith(`.${domain}`);
+  } catch { return false; }
 }
 
-function buildSearchUrl(engine, searchQuery) {
-  if (engine === "google") {
-    return `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&hl=bg&num=10&gbv=1`;
-  }
-
-  if (engine === "bing") {
-    return `https://www.bing.com/search?q=${encodeURIComponent(searchQuery)}&setlang=bg-BG`;
-  }
-
-  return `https://html.duckduckgo.com/html/?q=${encodeURIComponent(searchQuery)}`;
+/** Split query into meaningful keyword tokens */
+function toKeywords(query) {
+  return query
+    .toLowerCase()
+    .split(/[\s,;.!?]+/)
+    .filter(w => w.length > 1)
+    .filter(w => ![
+      "на", "за", "от", "и", "в", "с", "да", "не", "по", "се",
+      "ли", "е", "the", "a", "an", "is", "of", "for",
+    ].includes(w));
 }
+
+/** Score a URL/title by how many query keywords it contains */
+function keywordScore(text, keywords) {
+  const lower = (text || "").toLowerCase();
+  let hits = 0;
+  for (const kw of keywords) {
+    if (lower.includes(kw.toLowerCase())) hits++;
+  }
+  return hits;
+}
+
+// ── Browser lifecycle ─────────────────────────────────────────────────
 
 function resetIdleTimer() {
   if (idleTimer) clearTimeout(idleTimer);
-
-  idleTimer = setTimeout(() => {
-    closeBrowser().catch(() => {});
-  }, IDLE_BROWSER_MS);
-
-  if (typeof idleTimer.unref === "function") {
-    idleTimer.unref();
-  }
+  idleTimer = setTimeout(() => closeBrowser().catch(() => {}), IDLE_BROWSER_MS);
+  if (typeof idleTimer.unref === "function") idleTimer.unref();
 }
 
 async function getBrowser() {
   if (!browserPromise) {
     browserPromise = chromium.launch({
       headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-      ],
-    }).catch((err) => {
-      browserPromise = null;
-      throw err;
-    });
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    }).catch(err => { browserPromise = null; throw err; });
   }
-
   return browserPromise;
 }
 
 async function getContext() {
   if (!contextPromise) {
     const browser = await getBrowser();
-
     contextPromise = browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
       viewport: { width: 1366, height: 900 },
       locale: "bg-BG",
-    }).catch((err) => {
-      contextPromise = null;
-      throw err;
-    });
+    }).catch(err => { contextPromise = null; throw err; });
   }
-
   resetIdleTimer();
   return contextPromise;
 }
 
-function normalizeResultUrl(rawHref, engine) {
-  if (!rawHref) return "";
-
-  try {
-    if (rawHref.startsWith("/url?")) {
-      const url = new URL(`https://www.google.com${rawHref}`);
-      return url.searchParams.get("q") || "";
-    }
-
-    const parsed = new URL(rawHref);
-
-    if (engine === "google") {
-      const q = parsed.searchParams.get("q");
-      if (parsed.pathname === "/url" && q) return q;
-    }
-
-    if (engine === "duckduckgo") {
-      const uddg = parsed.searchParams.get("uddg");
-      if (uddg) return decodeURIComponent(uddg);
-    }
-
-    return parsed.href;
-  } catch {
-    return rawHref;
+export async function closeBrowser() {
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  if (contextPromise) {
+    const ctx = await contextPromise.catch(() => null);
+    contextPromise = null;
+    if (ctx) await ctx.close().catch(() => {});
+  }
+  if (browserPromise) {
+    const br = await browserPromise.catch(() => null);
+    browserPromise = null;
+    if (br) await br.close().catch(() => {});
   }
 }
 
-function sameDomain(targetUrl, domain) {
-  try {
-    const host = new URL(targetUrl).hostname.replace(/^www\./i, "");
-    return host === domain || host.endsWith(`.${domain}`);
-  } catch {
-    return false;
-  }
-}
+// ── Accept cookie / consent banners ───────────────────────────────────
 
-async function acceptConsentIfPresent(page) {
-  const buttons = [
-    'button:has-text("Приемам")',
-    'button:has-text("Accept")',
-    'button:has-text("I agree")',
-    'button:has-text("Съгласен")',
-    'button:has-text("Разбирам")',
-    '#L2AGLb',
-    'button[aria-label*="Accept"]',
+async function dismissOverlays(page) {
+  const btns = [
+    'button:has-text("Приемам")',  'button:has-text("Accept")',
+    'button:has-text("I agree")',   'button:has-text("Съгласен")',
+    'button:has-text("Разбирам")', '#L2AGLb',
+    'button[aria-label*="Accept"]', 'button:has-text("OK")',
+    'button:has-text("Добре")',     'button:has-text("Got it")',
   ];
-
-  for (const selector of buttons) {
+  for (const sel of btns) {
     try {
-      const el = page.locator(selector).first();
-      if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 600 }).catch(() => false)) {
         await el.click({ timeout: 1000 }).catch(() => {});
         return;
       }
@@ -181,377 +134,488 @@ async function acceptConsentIfPresent(page) {
   }
 }
 
-async function extractEngineLinks(page, domain, engine) {
-  const candidates = await page.evaluate(
-    ({ expectedDomain, currentEngine, maxLinks }) => {
-      const normalizeHost = (host) =>
-        String(host || "").replace(/^www\./i, "");
+// ── Extract page data (product page) ──────────────────────────────────
 
-      const sameDomain = (href) => {
-        try {
-          const url = new URL(href, location.href);
-          const host = normalizeHost(url.hostname);
-          return host === expectedDomain || host.endsWith(`.${expectedDomain}`);
-        } catch {
-          return false;
-        }
-      };
-
-      const normalizeHref = (href) => {
-        try {
-          if (!href) return "";
-
-          if (href.startsWith("/url?")) {
-            const url = new URL(`https://www.google.com${href}`);
-            return url.searchParams.get("q") || "";
-          }
-
-          const parsed = new URL(href, location.href);
-
-          if (currentEngine === "google") {
-            const q = parsed.searchParams.get("q");
-            if (parsed.pathname === "/url" && q) return q;
-          }
-
-          if (currentEngine === "duckduckgo") {
-            const uddg = parsed.searchParams.get("uddg");
-            if (uddg) return decodeURIComponent(uddg);
-          }
-
-          return parsed.href;
-        } catch {
-          return href || "";
-        }
-      };
-
-      const selectorsByEngine = {
-        google: [
-          "a h3",
-          "div.yuRUbf a",
-          "#search a[href]",
-          "a[href]"
-        ],
-        bing: [
-          "li.b_algo h2 a",
-          "#b_results h2 a",
-          "#b_results a[href]",
-          "a[href]"
-        ],
-        duckduckgo: [
-          "a.result__a",
-          ".result a[href]",
-          "a[href]"
-        ],
-      };
-
-      const selectors = selectorsByEngine[currentEngine] || ["a[href]"];
-      const found = [];
-
-      for (const selector of selectors) {
-        const nodes = Array.from(document.querySelectorAll(selector));
-
-        for (const node of nodes) {
-          const anchor = node.closest ? node.closest("a[href]") : node;
-          const href = anchor?.getAttribute?.("href") || anchor?.href || "";
-          const normalized = normalizeHref(href);
-
-          if (!normalized) continue;
-          if (!normalized.startsWith("http")) continue;
-          if (!sameDomain(normalized)) continue;
-
-          found.push(normalized);
-          if (found.length >= maxLinks) break;
-        }
-
-        if (found.length >= maxLinks) break;
-      }
-
-      return [...new Set(found)].slice(0, maxLinks);
-    },
-    {
-      expectedDomain: domain,
-      currentEngine: engine,
-      maxLinks: maxLinksSafe(MAX_RESULT_LINKS),
-    }
-  );
-
-  return unique(
-    candidates
-      .map((href) => normalizeResultUrl(href, engine))
-      .filter((href) => href && href.startsWith("http"))
-      .filter((href) => sameDomain(href, domain))
-  ).slice(0, maxLinksSafe(MAX_RESULT_LINKS));
-}
-
-async function clickFirstVisibleResult(page, domain, engine, logger) {
-  const selectorsByEngine = {
-    google: [
-      "div.yuRUbf a",
-      "a:has(h3)",
-      "#search a[href]"
-    ],
-    bing: [
-      "li.b_algo h2 a",
-      "#b_results h2 a",
-      "#b_results a[href]"
-    ],
-    duckduckgo: [
-      "a.result__a",
-      ".result a[href]"
-    ],
-  };
-
-  const selectors = selectorsByEngine[engine] || ["a[href]"];
-
-  for (const selector of selectors) {
-    const locator = page.locator(selector);
-    const count = await locator.count().catch(() => 0);
-
-    for (let i = 0; i < Math.min(count, 10); i++) {
-      try {
-        const link = locator.nth(i);
-        const href = await link.getAttribute("href").catch(() => "");
-        const normalized = normalizeResultUrl(href || "", engine);
-
-        if (!normalized) continue;
-        if (!sameDomain(normalized, domain)) continue;
-
-        logger?.info?.(
-          { engine, selector, target: normalized },
-          "[browser-search] click first visible result"
-        );
-
-        await page.goto(normalized, {
-          waitUntil: "domcontentloaded",
-          timeout: PAGE_TIMEOUT_MS,
-        });
-
-        return normalized;
-      } catch {}
-    }
-  }
-
-  return null;
-}
-
-async function inspectResultPage(context, url, logger) {
+/** Visit a URL, extract product-like data */
+async function inspectPage(context, url, logger) {
   const page = await context.newPage();
   page.setDefaultTimeout(PAGE_TIMEOUT_MS);
 
   try {
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: PAGE_TIMEOUT_MS,
-    });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS });
+    await dismissOverlays(page);
 
-    const data = await page.evaluate(() => {
-      const getMeta = (selector) =>
-        document.querySelector(selector)?.getAttribute("content")?.trim() || "";
-
-      const title = document.title || "";
-      const h1 = document.querySelector("h1")?.textContent?.trim() || "";
-      const bodyText = document.body?.innerText || "";
-
+    const d = await page.evaluate(() => {
+      const meta = (sel) =>
+        document.querySelector(sel)?.getAttribute("content")?.trim() || "";
       return {
-        title,
-        h1,
-        bodyText,
-        ogTitle: getMeta('meta[property="og:title"]'),
-        description: getMeta('meta[name="description"]'),
+        title:       document.title || "",
+        h1:          document.querySelector("h1")?.textContent?.trim() || "",
+        body:        document.body?.innerText || "",
+        ogTitle:     meta('meta[property="og:title"]'),
+        description: meta('meta[name="description"]'),
+        url:         location.href,
       };
     });
 
-    const excerptSource =
-      data.bodyText || data.description || data.h1 || data.title || "";
-
-    const excerpt = buildExcerpt(excerptSource);
-    const prices = extractPriceMatches(data.bodyText);
+    const body   = buildExcerpt(d.body);
+    const prices = extractPriceMatches(d.body);
 
     return {
-      url,
-      title: data.h1 || data.ogTitle || data.title || url,
-      excerpts: excerpt ? [excerpt] : [],
-      price: prices[0] || null,
+      url:              d.url || url,
+      title:            d.h1 || d.ogTitle || d.title || url,
+      excerpts:         body ? [body] : [],
+      price:            prices[0] || null,
       price_candidates: prices,
-      on_domain: true,
-      source: "search_engine_live",
+      on_domain:        true,
+      source:           "live_search",
     };
   } catch (err) {
-    logger?.warn?.(
-      {
-        url,
-        error: err instanceof Error ? err.message : String(err),
-      },
-      "[browser-search] failed to inspect result page"
-    );
-
+    logger?.warn?.({ url, error: err?.message }, "[inspect] page failed");
     return null;
   } finally {
     await page.close().catch(() => {});
   }
 }
 
-async function runEngineSearch({ context, engine, domain, searchQuery, logger }) {
-  const startedAt = Date.now();
-  const searchUrl = buildSearchUrl(engine, searchQuery);
+// ═══════════════════════════════════════════════════════════════════════
+//  STRATEGY 1 — Google (address bar style)
+//
+//  Пише в адрес бара: praktiker.bg пътечка 50x100 цена
+//  Намира линкове от домейна → кликва → извлича
+//  Също хваща Google AI snippet ако има
+// ═══════════════════════════════════════════════════════════════════════
+
+async function googleSearch({ context, domain, query, logger }) {
+  const started = Date.now();
+
+  // Address bar style — domain + keywords, NO site: operator
+  const searchText = `${domain} ${query}`;
+  const googleUrl  = `https://www.google.com/search?q=${encodeURIComponent(searchText)}&hl=bg&num=10&gbv=1`;
 
   const page = await context.newPage();
   page.setDefaultTimeout(PAGE_TIMEOUT_MS);
 
   try {
-    logger?.info?.(
-      { engine, searchUrl, domain, searchQuery },
-      "[browser-search] engine search start"
-    );
+    logger?.info?.({ searchText, googleUrl }, "[google] opening");
 
-    await page.goto(searchUrl, {
+    await page.goto(googleUrl, {
       waitUntil: "domcontentloaded",
       timeout: BROWSER_TIMEOUT_MS,
     });
+    await dismissOverlays(page);
+    await page.waitForTimeout(800);
 
-    await acceptConsentIfPresent(page);
+    // ── Extract domain links from Google results ────────────────────
+    const links = await page.evaluate(({ targetDomain }) => {
+      const normHost = (h) => String(h || "").replace(/^www\./i, "");
+      const isDomain = (href) => {
+        try {
+          const host = normHost(new URL(href).hostname);
+          return host === targetDomain || host.endsWith("." + targetDomain);
+        } catch { return false; }
+      };
+      const unwrap = (href) => {
+        try {
+          if (href?.startsWith("/url?")) {
+            return new URL("https://www.google.com" + href).searchParams.get("q") || "";
+          }
+          const u = new URL(href);
+          if (u.pathname === "/url" && u.searchParams.has("q"))
+            return u.searchParams.get("q");
+          return u.href;
+        } catch { return href || ""; }
+      };
 
-    let links = await extractEngineLinks(page, domain, engine);
+      const selectors = [
+        "div.yuRUbf a[href]",
+        "a:has(h3)",
+        "#search a[href]",
+      ];
 
-    if (!links.length) {
-      const clickedUrl = await clickFirstVisibleResult(page, domain, engine, logger);
-      if (clickedUrl) {
-        links = [clickedUrl];
+      const found = new Set();
+      for (const sel of selectors) {
+        for (const el of document.querySelectorAll(sel)) {
+          const raw = unwrap(el.getAttribute("href") || el.href || "");
+          if (raw && raw.startsWith("http") && isDomain(raw)) {
+            found.add(raw);
+            if (found.size >= 8) break;
+          }
+        }
+        if (found.size >= 8) break;
       }
-    }
+      return [...found];
+    }, { targetDomain: domain });
 
+    logger?.info?.(
+      { linksFound: links.length, links: links.slice(0, 5) },
+      "[google] extracted links"
+    );
+
+    // ── If no links, try grabbing Google AI / featured snippet ───────
     if (!links.length) {
+      const snippet = await page.evaluate(() => {
+        const sels = [
+          ".hgKElc", "[data-attrid] span",
+          ".IZ6rdc", ".xpdopen .LGOjhe",
+        ];
+        for (const sel of sels) {
+          const el = document.querySelector(sel);
+          if (el?.textContent?.trim()) return el.textContent.trim();
+        }
+        return "";
+      }).catch(() => "");
+
+      if (snippet) {
+        logger?.info?.({ snippetLen: snippet.length }, "[google] got AI/featured snippet");
+        return {
+          ok: true,
+          results: [{
+            url: googleUrl,
+            title: `Google snippet: ${query}`,
+            excerpts: [buildExcerpt(snippet)],
+            price: extractPriceMatches(snippet)[0] || null,
+            price_candidates: extractPriceMatches(snippet),
+            on_domain: false,
+            source: "google_snippet",
+          }],
+          reason: null,
+          elapsed_ms: Date.now() - started,
+          strategy: "google",
+        };
+      }
+
       return {
-        ok: false,
-        results: [],
-        reason: `no_links_found_on_${engine}`,
-        elapsed_ms: Date.now() - startedAt,
+        ok: false, results: [],
+        reason: "no_domain_links_on_google",
+        elapsed_ms: Date.now() - started,
+        strategy: "google",
       };
     }
 
+    // ── Rank links by keyword match, visit top ones ──────────────────
+    const keywords = toKeywords(query);
+    const ranked = links
+      .map(url => ({ url, score: keywordScore(url, keywords) }))
+      .sort((a, b) => b.score - a.score);
+
     const results = [];
-
-    for (const link of links) {
+    for (const { url } of ranked) {
       if (results.length >= MAX_PRODUCT_VISITS) break;
-
-      const data = await inspectResultPage(context, link, logger);
-      if (!data) continue;
-      results.push(data);
+      const data = await inspectPage(context, url, logger);
+      if (data) results.push(data);
     }
 
     return {
       ok: results.length > 0,
       results,
-      reason: results.length > 0 ? null : "no_extractable_results",
-      elapsed_ms: Date.now() - startedAt,
+      reason: results.length > 0 ? null : "pages_not_extractable",
+      elapsed_ms: Date.now() - started,
+      strategy: "google",
     };
-  } catch (err) {
-    logger?.warn?.(
-      {
-        engine,
-        searchQuery,
-        error: err instanceof Error ? err.message : String(err),
-      },
-      "[browser-search] engine search failed"
-    );
 
+  } catch (err) {
+    logger?.warn?.({ error: err?.message }, "[google] search failed");
     return {
-      ok: false,
-      results: [],
-      reason: err instanceof Error ? err.message : String(err),
-      elapsed_ms: Date.now() - startedAt,
+      ok: false, results: [],
+      reason: err?.message || "google_error",
+      elapsed_ms: Date.now() - started,
+      strategy: "google",
     };
   } finally {
     await page.close().catch(() => {});
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+//  STRATEGY 2 — Site internal search (fallback)
+//
+//  Отваря сайта и търси вътрешно:
+//  1. Пробва common search URL patterns
+//  2. Ако не стане — отваря homepage, намира search input, пише, enter
+// ═══════════════════════════════════════════════════════════════════════
+
+async function siteInternalSearch({ context, siteUrl, domain, query, logger }) {
+  const started = Date.now();
+  const page = await context.newPage();
+  page.setDefaultTimeout(PAGE_TIMEOUT_MS);
+
+  const baseUrl = siteUrl.replace(/\/+$/, "");
+
+  try {
+    // ── Try common search URL patterns ──────────────────────────────
+    const searchPaths = [
+      `/catalogsearch/result/?q=${encodeURIComponent(query)}`,
+      `/search?q=${encodeURIComponent(query)}`,
+      `/search/?q=${encodeURIComponent(query)}`,
+      `/search?search=${encodeURIComponent(query)}`,
+      `/търсене?q=${encodeURIComponent(query)}`,
+      `/?s=${encodeURIComponent(query)}`,
+    ];
+
+    for (const path of searchPaths) {
+      const tryUrl = `${baseUrl}${path}`;
+      logger?.info?.({ tryUrl }, "[site-search] trying URL pattern");
+
+      try {
+        const resp = await page.goto(tryUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: PAGE_TIMEOUT_MS,
+        });
+
+        if (!resp || resp.status() >= 400) continue;
+        await dismissOverlays(page);
+        await page.waitForTimeout(1000);
+
+        const productLinks = await extractProductLinks(page, domain);
+
+        if (productLinks.length > 0) {
+          logger?.info?.(
+            { path, linksFound: productLinks.length },
+            "[site-search] found product links"
+          );
+
+          const results = await visitTopLinks(context, productLinks, query, logger, "site_internal_search");
+          if (results.length > 0) {
+            return {
+              ok: true, results, reason: null,
+              elapsed_ms: Date.now() - started,
+              strategy: "site_search",
+            };
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    // ── Fallback: homepage → find search input → type → enter ────────
+    logger?.info?.("[site-search] trying homepage search input");
+
+    try {
+      await page.goto(baseUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: PAGE_TIMEOUT_MS,
+      });
+      await dismissOverlays(page);
+
+      const inputSelectors = [
+        'input[name="q"]', 'input[name="search"]', 'input[name="s"]',
+        'input[type="search"]', 'input[placeholder*="Търсене"]',
+        'input[placeholder*="Search"]', 'input[placeholder*="търси"]',
+        '#search', '.search-input', 'input.search',
+      ];
+
+      for (const sel of inputSelectors) {
+        try {
+          const input = page.locator(sel).first();
+          if (await input.isVisible({ timeout: 1500 }).catch(() => false)) {
+            await input.click();
+            await input.fill(query);
+            await page.keyboard.press("Enter");
+            await page.waitForLoadState("domcontentloaded", { timeout: PAGE_TIMEOUT_MS });
+            await page.waitForTimeout(1500);
+
+            logger?.info?.({ url: page.url() }, "[site-search] submitted search form");
+
+            const productLinks = await extractProductLinks(page, domain);
+            if (productLinks.length > 0) {
+              const results = await visitTopLinks(context, productLinks, query, logger, "site_search_form");
+              if (results.length > 0) {
+                return {
+                  ok: true, results, reason: null,
+                  elapsed_ms: Date.now() - started,
+                  strategy: "site_search_form",
+                };
+              }
+            }
+            break;
+          }
+        } catch {}
+      }
+    } catch (err) {
+      logger?.debug?.({ error: err?.message }, "[site-search] homepage fallback failed");
+    }
+
+    return {
+      ok: false, results: [],
+      reason: "site_search_no_results",
+      elapsed_ms: Date.now() - started,
+      strategy: "site_search",
+    };
+
+  } catch (err) {
+    logger?.warn?.({ error: err?.message }, "[site-search] failed");
+    return {
+      ok: false, results: [],
+      reason: err?.message || "site_search_error",
+      elapsed_ms: Date.now() - started,
+      strategy: "site_search",
+    };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+/** Extract product-like links from a search results page */
+async function extractProductLinks(page, domain) {
+  return page.evaluate(({ targetDomain }) => {
+    const normHost = (h) => String(h || "").replace(/^www\./i, "");
+    const isDomain = (href) => {
+      try {
+        const host = normHost(new URL(href, location.href).hostname);
+        return host === targetDomain || host.endsWith("." + targetDomain);
+      } catch { return false; }
+    };
+
+    const selectors = [
+      "a.product-item-link",
+      ".product-name a", ".product-title a", ".product a[href]",
+      "h2 a[href]", "h3 a[href]",
+      ".search-result a[href]", ".results a[href]",
+      "a[href*='/product']", "a[href*='/p/']", "a[href*='/catalog/']",
+      "article a[href]",
+    ];
+
+    const found = new Set();
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        const href = el.href || el.getAttribute("href") || "";
+        try {
+          const full = new URL(href, location.href).href;
+          if (full.startsWith("http") && isDomain(full)) {
+            found.add(full);
+            if (found.size >= 8) break;
+          }
+        } catch {}
+      }
+      if (found.size >= 8) break;
+    }
+
+    // Last resort — any non-utility link on domain
+    if (found.size === 0) {
+      for (const a of document.querySelectorAll("a[href]")) {
+        const href = a.href || "";
+        if (href.startsWith("http") && isDomain(href) &&
+            !href.match(/\/(cart|login|register|account|checkout)/i)) {
+          found.add(href);
+          if (found.size >= 8) break;
+        }
+      }
+    }
+
+    return [...found];
+  }, { targetDomain: domain });
+}
+
+/** Rank links by keyword relevance and visit the top ones */
+async function visitTopLinks(context, links, query, logger, source) {
+  const keywords = toKeywords(query);
+  const ranked = links
+    .map(url => ({ url, score: keywordScore(url, keywords) }))
+    .sort((a, b) => b.score - a.score);
+
+  const results = [];
+  for (const { url } of ranked) {
+    if (results.length >= MAX_PRODUCT_VISITS) break;
+    const data = await inspectPage(context, url, logger);
+    if (data) {
+      data.source = source;
+      results.push(data);
+    }
+  }
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  MAIN ENTRY — Google first, site search fallback
+// ═══════════════════════════════════════════════════════════════════════
+
 export async function browserSearch({ siteUrl, query, logger }) {
-  const startedAt = Date.now();
-  const domain = safeDomain(siteUrl);
+  const started = Date.now();
+  const domain  = safeDomain(siteUrl);
 
   if (!domain) {
     return {
-      ok: false,
-      results: [],
-      reason: "invalid_site_url",
-      elapsed_ms: Date.now() - startedAt,
-      engine_sequence: [],
-      failures: [],
+      ok: false, results: [], reason: "invalid_site_url",
+      elapsed_ms: Date.now() - started,
+      strategy: "none", engine_sequence: [], failures: [],
     };
   }
 
-  const context = await getContext();
-  const queries = buildSearchQueries(domain, query);
-  const engines = ["google", "bing", "duckduckgo"];
-
-  const engineSequence = [];
+  const context  = await getContext();
   const failures = [];
 
-  for (const searchQuery of queries) {
-    for (const engine of engines) {
-      engineSequence.push({ engine, searchQuery });
+  // ── 1. Google address-bar style ────────────────────────────────────
+  logger?.info?.({ domain, query }, "[search] → Strategy 1: Google");
 
-      const attempt = await runEngineSearch({
-        context,
-        engine,
-        domain,
-        searchQuery,
-        logger,
-      });
+  const googleResult = await googleSearch({ context, domain, query, logger });
 
-      if (attempt.ok && attempt.results.length > 0) {
-        return {
-          ok: true,
-          results: attempt.results,
-          reason: null,
-          elapsed_ms: Date.now() - startedAt,
-          engine_sequence: engineSequence,
-          failures,
-        };
-      }
-
-      failures.push({
-        engine,
-        searchQuery,
-        reason: attempt.reason || "unknown_error",
-      });
-    }
+  if (googleResult.ok && googleResult.results.length > 0) {
+    logger?.info?.(
+      { strategy: "google", count: googleResult.results.length, ms: Date.now() - started },
+      "[search] ✓ Google returned results"
+    );
+    return {
+      ...googleResult,
+      elapsed_ms: Date.now() - started,
+      engine_sequence: [{ engine: "google", searchQuery: `${domain} ${query}` }],
+      failures,
+    };
   }
 
+  failures.push({
+    engine: "google",
+    searchQuery: `${domain} ${query}`,
+    reason: googleResult.reason || "no_results",
+  });
+
+  // ── 2. Site internal search fallback ───────────────────────────────
+  logger?.info?.({ domain, query }, "[search] → Strategy 2: Site internal search");
+
+  const siteResult = await siteInternalSearch({ context, siteUrl, domain, query, logger });
+
+  if (siteResult.ok && siteResult.results.length > 0) {
+    logger?.info?.(
+      { strategy: siteResult.strategy, count: siteResult.results.length, ms: Date.now() - started },
+      "[search] ✓ Site search returned results"
+    );
+    return {
+      ...siteResult,
+      elapsed_ms: Date.now() - started,
+      engine_sequence: [
+        { engine: "google", searchQuery: `${domain} ${query}` },
+        { engine: "site_search", searchQuery: query },
+      ],
+      failures,
+    };
+  }
+
+  failures.push({
+    engine: "site_search",
+    searchQuery: query,
+    reason: siteResult.reason || "no_results",
+  });
+
+  // ── Nothing found ─────────────────────────────────────────────────
+  logger?.warn?.(
+    { domain, query, ms: Date.now() - started },
+    "[search] ✗ All strategies exhausted"
+  );
+
   return {
-    ok: false,
-    results: [],
+    ok: false, results: [], confidence: 0,
     reason: failures.at(-1)?.reason || "no_results",
-    elapsed_ms: Date.now() - startedAt,
-    engine_sequence: engineSequence,
+    elapsed_ms: Date.now() - started,
+    strategy: "none",
+    engine_sequence: [
+      { engine: "google", searchQuery: `${domain} ${query}` },
+      { engine: "site_search", searchQuery: query },
+    ],
     failures,
   };
 }
 
 export async function browserSearchWithRetry(opts) {
   return browserSearch(opts);
-}
-
-export async function closeBrowser() {
-  if (idleTimer) {
-    clearTimeout(idleTimer);
-    idleTimer = null;
-  }
-
-  if (contextPromise) {
-    const context = await contextPromise.catch(() => null);
-    contextPromise = null;
-    if (context) {
-      await context.close().catch(() => {});
-    }
-  }
-
-  if (browserPromise) {
-    const browser = await browserPromise.catch(() => null);
-    browserPromise = null;
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
-  }
 }
