@@ -2,25 +2,36 @@ import { chromium } from "playwright";
 
 // ── Config ────────────────────────────────────────────────────────────
 const BROWSER_TIMEOUT_MS = Number(process.env.BROWSER_TIMEOUT_MS || 25000);
-const PAGE_TIMEOUT_MS    = Number(process.env.PAGE_TIMEOUT_MS    || 15000);
+const PAGE_TIMEOUT_MS = Number(process.env.PAGE_TIMEOUT_MS || 15000);
 const MAX_PRODUCT_VISITS = Number(process.env.MAX_PRODUCT_VISITS || 3);
-const IDLE_BROWSER_MS    = Number(process.env.IDLE_BROWSER_MS    || 10 * 60 * 1000);
+const IDLE_BROWSER_MS = Number(process.env.IDLE_BROWSER_MS || 10 * 60 * 1000);
+const BRAVE_API_KEY = String(process.env.BRAVE_API_KEY || "").trim();
+const BRAVE_API_BASE = String(process.env.BRAVE_API_BASE || "https://api.search.brave.com/res/v1/web/search").trim();
+const BRAVE_RESULTS_COUNT = Math.max(1, Math.min(Number(process.env.BRAVE_RESULTS_COUNT || 8), 20));
+const BRAVE_COUNTRY = String(process.env.BRAVE_COUNTRY || "BG").trim();
+const BRAVE_SEARCH_LANG = String(process.env.BRAVE_SEARCH_LANG || "bg").trim();
 
 // ── Browser singleton ─────────────────────────────────────────────────
 let browserPromise = null;
 let contextPromise = null;
-let idleTimer      = null;
+let idleTimer = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────
-
 function safeDomain(siteUrl) {
-  try { return new URL(siteUrl).hostname.replace(/^www\./i, ""); }
-  catch { return ""; }
+  try {
+    return new URL(siteUrl).hostname.replace(/^www\./i, "");
+  } catch {
+    return "";
+  }
 }
 
-function norm(v) { return String(v || "").replace(/\s+/g, " ").trim(); }
+function norm(v) {
+  return String(v || "").replace(/\s+/g, " ").trim();
+}
 
-function buildExcerpt(text, max = 1500) { return norm(text).slice(0, max); }
+function buildExcerpt(text, max = 1500) {
+  return norm(text).slice(0, max);
+}
 
 function unique(arr) {
   return [...new Set((Array.isArray(arr) ? arr : []).filter(Boolean))];
@@ -39,28 +50,38 @@ function extractPriceMatches(text) {
   return unique(out);
 }
 
-function sameDomain(url, domain) {
-  try {
-    const h = new URL(url).hostname.replace(/^www\./i, "");
-    return h === domain || h.endsWith(`.${domain}`);
-  } catch { return false; }
-}
-
-/** Split query into meaningful keyword tokens */
 function toKeywords(query) {
   return query
     .toLowerCase()
     .split(/[\s,;.!?]+/)
-    .filter(w => w.length > 1)
-    .filter(w => ![
-      "на", "за", "от", "и", "в", "с", "да", "не", "по", "се",
-      "ли", "е", "the", "a", "an", "is", "of", "for",
-    ].includes(w));
+    .filter((w) => w.length > 1)
+    .filter(
+      (w) =>
+        ![
+          "на",
+          "за",
+          "от",
+          "и",
+          "в",
+          "с",
+          "да",
+          "не",
+          "по",
+          "се",
+          "ли",
+          "е",
+          "the",
+          "a",
+          "an",
+          "is",
+          "of",
+          "for",
+        ].includes(w)
+    );
 }
 
-/** Score a URL/title by how many query keywords it contains */
 function keywordScore(text, keywords) {
-  const lower = (text || "").toLowerCase();
+  const lower = String(text || "").toLowerCase();
   let hits = 0;
   for (const kw of keywords) {
     if (lower.includes(kw.toLowerCase())) hits++;
@@ -68,8 +89,22 @@ function keywordScore(text, keywords) {
   return hits;
 }
 
-// ── Browser lifecycle ─────────────────────────────────────────────────
+function boostScoreForDomain(url, domain) {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./i, "");
+    if (host === domain) return 100;
+    if (host.endsWith(`.${domain}`)) return 80;
+    return 0;
+  } catch {
+    return 0;
+  }
+}
 
+function buildBraveQuery(domain, query) {
+  return `site:${domain} ${query}`.trim();
+}
+
+// ── Browser lifecycle ─────────────────────────────────────────────────
 function resetIdleTimer() {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => closeBrowser().catch(() => {}), IDLE_BROWSER_MS);
@@ -78,10 +113,15 @@ function resetIdleTimer() {
 
 async function getBrowser() {
   if (!browserPromise) {
-    browserPromise = chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    }).catch(err => { browserPromise = null; throw err; });
+    browserPromise = chromium
+      .launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      })
+      .catch((err) => {
+        browserPromise = null;
+        throw err;
+      });
   }
   return browserPromise;
 }
@@ -89,18 +129,27 @@ async function getBrowser() {
 async function getContext() {
   if (!contextPromise) {
     const browser = await getBrowser();
-    contextPromise = browser.newContext({
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-      viewport: { width: 1366, height: 900 },
-      locale: "bg-BG",
-    }).catch(err => { contextPromise = null; throw err; });
+    contextPromise = browser
+      .newContext({
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        viewport: { width: 1366, height: 900 },
+        locale: "bg-BG",
+      })
+      .catch((err) => {
+        contextPromise = null;
+        throw err;
+      });
   }
   resetIdleTimer();
   return contextPromise;
 }
 
 export async function closeBrowser() {
-  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
   if (contextPromise) {
     const ctx = await contextPromise.catch(() => null);
     contextPromise = null;
@@ -113,16 +162,20 @@ export async function closeBrowser() {
   }
 }
 
-// ── Accept cookie / consent banners ───────────────────────────────────
-
 async function dismissOverlays(page) {
   const btns = [
-    'button:has-text("Приемам")',  'button:has-text("Accept")',
-    'button:has-text("I agree")',   'button:has-text("Съгласен")',
-    'button:has-text("Разбирам")', '#L2AGLb',
-    'button[aria-label*="Accept"]', 'button:has-text("OK")',
-    'button:has-text("Добре")',     'button:has-text("Got it")',
+    'button:has-text("Приемам")',
+    'button:has-text("Accept")',
+    'button:has-text("I agree")',
+    'button:has-text("Съгласен")',
+    'button:has-text("Разбирам")',
+    "#L2AGLb",
+    'button[aria-label*="Accept"]',
+    'button:has-text("OK")',
+    'button:has-text("Добре")',
+    'button:has-text("Got it")',
   ];
+
   for (const sel of btns) {
     try {
       const el = page.locator(sel).first();
@@ -134,9 +187,7 @@ async function dismissOverlays(page) {
   }
 }
 
-// ── Extract page data (product page) ──────────────────────────────────
-
-/** Visit a URL, extract product-like data */
+// ── Extract page data ─────────────────────────────────────────────────
 async function inspectPage(context, url, logger) {
   const page = await context.newPage();
   page.setDefaultTimeout(PAGE_TIMEOUT_MS);
@@ -146,29 +197,28 @@ async function inspectPage(context, url, logger) {
     await dismissOverlays(page);
 
     const d = await page.evaluate(() => {
-      const meta = (sel) =>
-        document.querySelector(sel)?.getAttribute("content")?.trim() || "";
+      const meta = (sel) => document.querySelector(sel)?.getAttribute("content")?.trim() || "";
       return {
-        title:       document.title || "",
-        h1:          document.querySelector("h1")?.textContent?.trim() || "",
-        body:        document.body?.innerText || "",
-        ogTitle:     meta('meta[property="og:title"]'),
+        title: document.title || "",
+        h1: document.querySelector("h1")?.textContent?.trim() || "",
+        body: document.body?.innerText || "",
+        ogTitle: meta('meta[property="og:title"]'),
         description: meta('meta[name="description"]'),
-        url:         location.href,
+        url: location.href,
       };
     });
 
-    const body   = buildExcerpt(d.body);
+    const body = buildExcerpt(d.body);
     const prices = extractPriceMatches(d.body);
 
     return {
-      url:              d.url || url,
-      title:            d.h1 || d.ogTitle || d.title || url,
-      excerpts:         body ? [body] : [],
-      price:            prices[0] || null,
+      url: d.url || url,
+      title: d.h1 || d.ogTitle || d.title || url,
+      excerpts: unique([body, d.description].filter(Boolean)).slice(0, 2),
+      price: prices[0] || null,
       price_candidates: prices,
-      on_domain:        true,
-      source:           "live_search",
+      on_domain: true,
+      source: "brave_live_page",
     };
   } catch (err) {
     logger?.warn?.({ url, error: err?.message }, "[inspect] page failed");
@@ -178,440 +228,178 @@ async function inspectPage(context, url, logger) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-//  STRATEGY 1 — Google (address bar style)
-//
-//  Пише в адрес бара: praktiker.bg пътечка 50x100 цена
-//  Намира линкове от домейна → кликва → извлича
-//  Също хваща Google AI snippet ако има
-// ═══════════════════════════════════════════════════════════════════════
-
-async function googleSearch({ context, domain, query, logger }) {
+// ── Brave API search ──────────────────────────────────────────────────
+async function braveSearch({ context, domain, query, logger }) {
   const started = Date.now();
 
-  // Address bar style — domain + keywords, NO site: operator
-  const searchText = `${domain} ${query}`;
-  const googleUrl  = `https://www.google.com/search?q=${encodeURIComponent(searchText)}&hl=bg&num=10&gbv=1`;
+  if (!BRAVE_API_KEY) {
+    return {
+      ok: false,
+      results: [],
+      reason: "missing_brave_api_key",
+      elapsed_ms: Date.now() - started,
+      strategy: "brave",
+      brave_query: null,
+    };
+  }
 
-  const page = await context.newPage();
-  page.setDefaultTimeout(PAGE_TIMEOUT_MS);
+  const braveQuery = buildBraveQuery(domain, query);
+  const searchUrl = new URL(BRAVE_API_BASE);
+  searchUrl.searchParams.set("q", braveQuery);
+  searchUrl.searchParams.set("count", String(BRAVE_RESULTS_COUNT));
+  searchUrl.searchParams.set("country", BRAVE_COUNTRY);
+  searchUrl.searchParams.set("search_lang", BRAVE_SEARCH_LANG);
+  searchUrl.searchParams.set("safesearch", "off");
+  searchUrl.searchParams.set("spellcheck", "true");
+  searchUrl.searchParams.set("result_filter", "web");
 
   try {
-    logger?.info?.({ searchText, googleUrl }, "[google] opening");
+    logger?.info?.({ braveQuery, url: searchUrl.toString() }, "[brave] searching");
 
-    await page.goto(googleUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: BROWSER_TIMEOUT_MS,
+    const resp = await fetch(searchUrl, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "X-Subscription-Token": BRAVE_API_KEY,
+      },
     });
-    await dismissOverlays(page);
-    await page.waitForTimeout(800);
 
-    // ── Extract domain links from Google results ────────────────────
-    const links = await page.evaluate(({ targetDomain }) => {
-      const normHost = (h) => String(h || "").replace(/^www\./i, "");
-      const isDomain = (href) => {
-        try {
-          const host = normHost(new URL(href).hostname);
-          return host === targetDomain || host.endsWith("." + targetDomain);
-        } catch { return false; }
-      };
-      const unwrap = (href) => {
-        try {
-          if (href?.startsWith("/url?")) {
-            return new URL("https://www.google.com" + href).searchParams.get("q") || "";
-          }
-          const u = new URL(href);
-          if (u.pathname === "/url" && u.searchParams.has("q"))
-            return u.searchParams.get("q");
-          return u.href;
-        } catch { return href || ""; }
-      };
-
-      const selectors = [
-        "div.yuRUbf a[href]",
-        "a:has(h3)",
-        "#search a[href]",
-      ];
-
-      const found = new Set();
-      for (const sel of selectors) {
-        for (const el of document.querySelectorAll(sel)) {
-          const raw = unwrap(el.getAttribute("href") || el.href || "");
-          if (raw && raw.startsWith("http") && isDomain(raw)) {
-            found.add(raw);
-            if (found.size >= 8) break;
-          }
-        }
-        if (found.size >= 8) break;
-      }
-      return [...found];
-    }, { targetDomain: domain });
-
-    logger?.info?.(
-      { linksFound: links.length, links: links.slice(0, 5) },
-      "[google] extracted links"
-    );
-
-    // ── If no links, try grabbing Google AI / featured snippet ───────
-    if (!links.length) {
-      const snippet = await page.evaluate(() => {
-        const sels = [
-          ".hgKElc", "[data-attrid] span",
-          ".IZ6rdc", ".xpdopen .LGOjhe",
-        ];
-        for (const sel of sels) {
-          const el = document.querySelector(sel);
-          if (el?.textContent?.trim()) return el.textContent.trim();
-        }
-        return "";
-      }).catch(() => "");
-
-      if (snippet) {
-        logger?.info?.({ snippetLen: snippet.length }, "[google] got AI/featured snippet");
-        return {
-          ok: true,
-          results: [{
-            url: googleUrl,
-            title: `Google snippet: ${query}`,
-            excerpts: [buildExcerpt(snippet)],
-            price: extractPriceMatches(snippet)[0] || null,
-            price_candidates: extractPriceMatches(snippet),
-            on_domain: false,
-            source: "google_snippet",
-          }],
-          reason: null,
-          elapsed_ms: Date.now() - started,
-          strategy: "google",
-        };
-      }
-
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
       return {
-        ok: false, results: [],
-        reason: "no_domain_links_on_google",
+        ok: false,
+        results: [],
+        reason: `brave_http_${resp.status}${text ? `:${text.slice(0, 180)}` : ""}`,
         elapsed_ms: Date.now() - started,
-        strategy: "google",
+        strategy: "brave",
+        brave_query: braveQuery,
       };
     }
 
-    // ── Rank links by keyword match, visit top ones ──────────────────
-    const keywords = toKeywords(query);
-    const ranked = links
-      .map(url => ({ url, score: keywordScore(url, keywords) }))
+    const json = await resp.json();
+    const rawResults = Array.isArray(json?.web?.results) ? json.web.results : [];
+
+    const ranked = rawResults
+      .map((item) => {
+        const url = item?.url || item?.profile?.url || "";
+        const title = item?.title || "";
+        const description = item?.description || item?.snippet || "";
+        return {
+          url,
+          title,
+          description,
+          score:
+            boostScoreForDomain(url, domain) +
+            keywordScore(`${title} ${description} ${url}`, toKeywords(query)),
+        };
+      })
+      .filter((item) => item.url && item.title)
       .sort((a, b) => b.score - a.score);
 
-    const results = [];
-    for (const { url } of ranked) {
-      if (results.length >= MAX_PRODUCT_VISITS) break;
-      const data = await inspectPage(context, url, logger);
-      if (data) results.push(data);
-    }
+    logger?.info?.({ count: ranked.length, top: ranked.slice(0, 5) }, "[brave] results ranked");
 
-    return {
-      ok: results.length > 0,
-      results,
-      reason: results.length > 0 ? null : "pages_not_extractable",
-      elapsed_ms: Date.now() - started,
-      strategy: "google",
-    };
+    const output = [];
+    for (const item of ranked) {
+      if (output.length >= MAX_PRODUCT_VISITS) break;
 
-  } catch (err) {
-    logger?.warn?.({ error: err?.message }, "[google] search failed");
-    return {
-      ok: false, results: [],
-      reason: err?.message || "google_error",
-      elapsed_ms: Date.now() - started,
-      strategy: "google",
-    };
-  } finally {
-    await page.close().catch(() => {});
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  STRATEGY 2 — Site internal search (fallback)
-//
-//  Отваря сайта и търси вътрешно:
-//  1. Пробва common search URL patterns
-//  2. Ако не стане — отваря homepage, намира search input, пише, enter
-// ═══════════════════════════════════════════════════════════════════════
-
-async function siteInternalSearch({ context, siteUrl, domain, query, logger }) {
-  const started = Date.now();
-  const page = await context.newPage();
-  page.setDefaultTimeout(PAGE_TIMEOUT_MS);
-
-  const baseUrl = siteUrl.replace(/\/+$/, "");
-
-  try {
-    // ── Try common search URL patterns ──────────────────────────────
-    const searchPaths = [
-      `/catalogsearch/result/?q=${encodeURIComponent(query)}`,
-      `/search?q=${encodeURIComponent(query)}`,
-      `/search/?q=${encodeURIComponent(query)}`,
-      `/search?search=${encodeURIComponent(query)}`,
-      `/търсене?q=${encodeURIComponent(query)}`,
-      `/?s=${encodeURIComponent(query)}`,
-    ];
-
-    for (const path of searchPaths) {
-      const tryUrl = `${baseUrl}${path}`;
-      logger?.info?.({ tryUrl }, "[site-search] trying URL pattern");
-
-      try {
-        const resp = await page.goto(tryUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: PAGE_TIMEOUT_MS,
-        });
-
-        if (!resp || resp.status() >= 400) continue;
-        await dismissOverlays(page);
-        await page.waitForTimeout(1000);
-
-        const productLinks = await extractProductLinks(page, domain);
-
-        if (productLinks.length > 0) {
-          logger?.info?.(
-            { path, linksFound: productLinks.length },
-            "[site-search] found product links"
-          );
-
-          const results = await visitTopLinks(context, productLinks, query, logger, "site_internal_search");
-          if (results.length > 0) {
-            return {
-              ok: true, results, reason: null,
-              elapsed_ms: Date.now() - started,
-              strategy: "site_search",
-            };
-          }
-        }
-      } catch {
+      const livePage = await inspectPage(context, item.url, logger);
+      if (livePage) {
+        livePage.title = livePage.title || item.title;
+        livePage.excerpts = unique([
+          ...(livePage.excerpts || []),
+          buildExcerpt(item.description, 400),
+        ]).slice(0, 3);
+        livePage.source = "brave_live_page";
+        output.push(livePage);
         continue;
       }
-    }
 
-    // ── Fallback: homepage → find search input → type → enter ────────
-    logger?.info?.("[site-search] trying homepage search input");
-
-    try {
-      await page.goto(baseUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: PAGE_TIMEOUT_MS,
+      output.push({
+        url: item.url,
+        title: item.title,
+        excerpts: [buildExcerpt(item.description, 600)].filter(Boolean),
+        price: extractPriceMatches(item.description)[0] || null,
+        price_candidates: extractPriceMatches(item.description),
+        on_domain: boostScoreForDomain(item.url, domain) > 0,
+        source: "brave_snippet",
       });
-      await dismissOverlays(page);
-
-      const inputSelectors = [
-        'input[name="q"]', 'input[name="search"]', 'input[name="s"]',
-        'input[type="search"]', 'input[placeholder*="Търсене"]',
-        'input[placeholder*="Search"]', 'input[placeholder*="търси"]',
-        '#search', '.search-input', 'input.search',
-      ];
-
-      for (const sel of inputSelectors) {
-        try {
-          const input = page.locator(sel).first();
-          if (await input.isVisible({ timeout: 1500 }).catch(() => false)) {
-            await input.click();
-            await input.fill(query);
-            await page.keyboard.press("Enter");
-            await page.waitForLoadState("domcontentloaded", { timeout: PAGE_TIMEOUT_MS });
-            await page.waitForTimeout(1500);
-
-            logger?.info?.({ url: page.url() }, "[site-search] submitted search form");
-
-            const productLinks = await extractProductLinks(page, domain);
-            if (productLinks.length > 0) {
-              const results = await visitTopLinks(context, productLinks, query, logger, "site_search_form");
-              if (results.length > 0) {
-                return {
-                  ok: true, results, reason: null,
-                  elapsed_ms: Date.now() - started,
-                  strategy: "site_search_form",
-                };
-              }
-            }
-            break;
-          }
-        } catch {}
-      }
-    } catch (err) {
-      logger?.debug?.({ error: err?.message }, "[site-search] homepage fallback failed");
     }
 
     return {
-      ok: false, results: [],
-      reason: "site_search_no_results",
+      ok: output.length > 0,
+      results: output,
+      reason: output.length > 0 ? null : "brave_no_results",
       elapsed_ms: Date.now() - started,
-      strategy: "site_search",
+      strategy: "brave",
+      brave_query: braveQuery,
     };
-
   } catch (err) {
-    logger?.warn?.({ error: err?.message }, "[site-search] failed");
+    logger?.warn?.({ error: err?.message }, "[brave] search failed");
     return {
-      ok: false, results: [],
-      reason: err?.message || "site_search_error",
+      ok: false,
+      results: [],
+      reason: err?.message || "brave_error",
       elapsed_ms: Date.now() - started,
-      strategy: "site_search",
+      strategy: "brave",
+      brave_query: braveQuery,
     };
-  } finally {
-    await page.close().catch(() => {});
   }
 }
 
-/** Extract product-like links from a search results page */
-async function extractProductLinks(page, domain) {
-  return page.evaluate(({ targetDomain }) => {
-    const normHost = (h) => String(h || "").replace(/^www\./i, "");
-    const isDomain = (href) => {
-      try {
-        const host = normHost(new URL(href, location.href).hostname);
-        return host === targetDomain || host.endsWith("." + targetDomain);
-      } catch { return false; }
-    };
-
-    const selectors = [
-      "a.product-item-link",
-      ".product-name a", ".product-title a", ".product a[href]",
-      "h2 a[href]", "h3 a[href]",
-      ".search-result a[href]", ".results a[href]",
-      "a[href*='/product']", "a[href*='/p/']", "a[href*='/catalog/']",
-      "article a[href]",
-    ];
-
-    const found = new Set();
-    for (const sel of selectors) {
-      for (const el of document.querySelectorAll(sel)) {
-        const href = el.href || el.getAttribute("href") || "";
-        try {
-          const full = new URL(href, location.href).href;
-          if (full.startsWith("http") && isDomain(full)) {
-            found.add(full);
-            if (found.size >= 8) break;
-          }
-        } catch {}
-      }
-      if (found.size >= 8) break;
-    }
-
-    // Last resort — any non-utility link on domain
-    if (found.size === 0) {
-      for (const a of document.querySelectorAll("a[href]")) {
-        const href = a.href || "";
-        if (href.startsWith("http") && isDomain(href) &&
-            !href.match(/\/(cart|login|register|account|checkout)/i)) {
-          found.add(href);
-          if (found.size >= 8) break;
-        }
-      }
-    }
-
-    return [...found];
-  }, { targetDomain: domain });
-}
-
-/** Rank links by keyword relevance and visit the top ones */
-async function visitTopLinks(context, links, query, logger, source) {
-  const keywords = toKeywords(query);
-  const ranked = links
-    .map(url => ({ url, score: keywordScore(url, keywords) }))
-    .sort((a, b) => b.score - a.score);
-
-  const results = [];
-  for (const { url } of ranked) {
-    if (results.length >= MAX_PRODUCT_VISITS) break;
-    const data = await inspectPage(context, url, logger);
-    if (data) {
-      data.source = source;
-      results.push(data);
-    }
-  }
-  return results;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  MAIN ENTRY — Google first, site search fallback
-// ═══════════════════════════════════════════════════════════════════════
-
+// ── Main entry ────────────────────────────────────────────────────────
 export async function browserSearch({ siteUrl, query, logger }) {
   const started = Date.now();
-  const domain  = safeDomain(siteUrl);
+  const domain = safeDomain(siteUrl);
 
   if (!domain) {
     return {
-      ok: false, results: [], reason: "invalid_site_url",
+      ok: false,
+      results: [],
+      reason: "invalid_site_url",
       elapsed_ms: Date.now() - started,
-      strategy: "none", engine_sequence: [], failures: [],
+      strategy: "none",
+      engine_sequence: [],
+      failures: [],
     };
   }
 
-  const context  = await getContext();
+  const context = await getContext();
   const failures = [];
 
-  // ── 1. Google address-bar style ────────────────────────────────────
-  logger?.info?.({ domain, query }, "[search] → Strategy 1: Google");
+  logger?.info?.({ domain, query }, "[search] → Strategy: Brave API");
 
-  const googleResult = await googleSearch({ context, domain, query, logger });
+  const braveResult = await braveSearch({ context, domain, query, logger });
 
-  if (googleResult.ok && googleResult.results.length > 0) {
+  if (braveResult.ok && braveResult.results.length > 0) {
     logger?.info?.(
-      { strategy: "google", count: googleResult.results.length, ms: Date.now() - started },
-      "[search] ✓ Google returned results"
+      { strategy: "brave", count: braveResult.results.length, ms: Date.now() - started },
+      "[search] ✓ Brave returned results"
     );
+
     return {
-      ...googleResult,
+      ...braveResult,
       elapsed_ms: Date.now() - started,
-      engine_sequence: [{ engine: "google", searchQuery: `${domain} ${query}` }],
+      engine_sequence: [{ engine: "brave", searchQuery: braveResult.brave_query || buildBraveQuery(domain, query) }],
       failures,
     };
   }
 
   failures.push({
-    engine: "google",
-    searchQuery: `${domain} ${query}`,
-    reason: googleResult.reason || "no_results",
+    engine: "brave",
+    searchQuery: braveResult.brave_query || buildBraveQuery(domain, query),
+    reason: braveResult.reason || "no_results",
   });
 
-  // ── 2. Site internal search fallback ───────────────────────────────
-  logger?.info?.({ domain, query }, "[search] → Strategy 2: Site internal search");
-
-  const siteResult = await siteInternalSearch({ context, siteUrl, domain, query, logger });
-
-  if (siteResult.ok && siteResult.results.length > 0) {
-    logger?.info?.(
-      { strategy: siteResult.strategy, count: siteResult.results.length, ms: Date.now() - started },
-      "[search] ✓ Site search returned results"
-    );
-    return {
-      ...siteResult,
-      elapsed_ms: Date.now() - started,
-      engine_sequence: [
-        { engine: "google", searchQuery: `${domain} ${query}` },
-        { engine: "site_search", searchQuery: query },
-      ],
-      failures,
-    };
-  }
-
-  failures.push({
-    engine: "site_search",
-    searchQuery: query,
-    reason: siteResult.reason || "no_results",
-  });
-
-  // ── Nothing found ─────────────────────────────────────────────────
-  logger?.warn?.(
-    { domain, query, ms: Date.now() - started },
-    "[search] ✗ All strategies exhausted"
-  );
+  logger?.warn?.({ domain, query, ms: Date.now() - started }, "[search] ✗ Brave returned no usable results");
 
   return {
-    ok: false, results: [], confidence: 0,
+    ok: false,
+    results: [],
+    confidence: 0,
     reason: failures.at(-1)?.reason || "no_results",
     elapsed_ms: Date.now() - started,
     strategy: "none",
-    engine_sequence: [
-      { engine: "google", searchQuery: `${domain} ${query}` },
-      { engine: "site_search", searchQuery: query },
-    ],
+    engine_sequence: [{ engine: "brave", searchQuery: braveResult.brave_query || buildBraveQuery(domain, query) }],
     failures,
   };
 }
