@@ -8,7 +8,7 @@ const app = Fastify({
 
 const PORT = Number(process.env.PORT || 3210);
 const WORKER_SECRET = process.env.WORKER_SECRET || "";
-const MODE = "browser_first";
+const MODE = "brave_api";
 
 app.addHook("preHandler", async (req, reply) => {
   if (req.url === "/health" || req.url === "/ready") return;
